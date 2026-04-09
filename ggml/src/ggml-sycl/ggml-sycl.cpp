@@ -4029,19 +4029,19 @@ static void ggml_sycl_im2col(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 
 static void ggml_sycl_sum(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
-    GGML_ASSERT(ggml_is_contiguous(dst->src[0]));
+    GGML_ASSERT(ggml_is_contiguous_rows(dst->src[0]));
     ggml_sycl_op_sum(ctx, dst);
 }
 
 static void ggml_sycl_sum_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
-    GGML_ASSERT(ggml_is_contiguous(dst->src[0]));
+    GGML_ASSERT(ggml_is_contiguous_rows(dst->src[0]));
     ggml_sycl_op_sum_rows(ctx, dst);
 }
 
 static void ggml_sycl_mean(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
-    GGML_ASSERT(ggml_is_contiguous(dst->src[0]));
+    GGML_ASSERT(ggml_is_contiguous_rows(dst->src[0]));
     ggml_sycl_op_mean(ctx, dst);
 }
 
@@ -5032,7 +5032,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
-            return ggml_is_contiguous(op->src[0]);
+            return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_ARGSORT:
             return op->src[0]->ne[0] * sizeof(int) <=
                    ggml_sycl_info().devices[device].smpbo;
