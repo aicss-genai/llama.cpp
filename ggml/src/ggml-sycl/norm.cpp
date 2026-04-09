@@ -94,7 +94,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
-        item_ct1.barrier();
+        item_ct1.barrier(sycl::access::fence_space::local_space);
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
         {
@@ -129,7 +129,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
-        item_ct1.barrier();
+        item_ct1.barrier(sycl::access::fence_space::local_space);
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
         {

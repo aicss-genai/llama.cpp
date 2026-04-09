@@ -3808,7 +3808,7 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
-    item_ct1.barrier();
+    item_ct1.barrier(sycl::access::fence_space::local_space);
 
     const float * src1_row_original = (const float *)(src1_original + i11*nb11 + i12*nb12);
     float * src1_row_contiguous = (float *)(src1_contiguous + src1_row*nb11);

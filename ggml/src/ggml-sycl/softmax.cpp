@@ -108,12 +108,12 @@ static void soft_max_f32(const float *         x,
         if (warp_id == 0) {
             buf_iw[lane_id] = -INFINITY;
         }
-        item_ct1.barrier();
+        item_ct1.barrier(sycl::access::fence_space::local_space);
 
         if (lane_id == 0) {
             buf_iw[warp_id] = max_val;
         }
-        item_ct1.barrier();
+        item_ct1.barrier(sycl::access::fence_space::local_space);
 
         max_val = buf_iw[lane_id];
         max_val = warp_reduce_max<WARP_SIZE>(max_val);
@@ -135,19 +135,19 @@ static void soft_max_f32(const float *         x,
     // find the sum of exps in the block
     tmp = warp_reduce_sum<WARP_SIZE>(tmp);
     if (block_size > WARP_SIZE) {
-        item_ct1.barrier();
+        item_ct1.barrier(sycl::access::fence_space::local_space);
         if (warp_id == 0) {
             buf_iw[lane_id] = 0.0f;
             for (size_t i = 1; i < nreduce; i += 1) {
                 buf_iw[lane_id + i * WARP_SIZE] = 0.f;
             }
         }
-        item_ct1.barrier();
+        item_ct1.barrier(sycl::access::fence_space::local_space);
 
         if (lane_id == 0) {
             buf_iw[warp_id] = tmp;
         }
-        item_ct1.barrier();
+        item_ct1.barrier(sycl::access::fence_space::local_space);
 
         tmp = buf_iw[lane_id];
         for (size_t i = 1; i < nreduce; i += 1) {
