@@ -1774,9 +1774,6 @@ static void ggml_mul_mat_p021_f16_f32_sycl(const void *vx, const float *y,
     const sycl::range<3> block_nums(nchannels_y, nrows_x, 1);
     const sycl::range<3> block_dims(1, 1, WARP_SIZE);
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
-
         stream->parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -1794,9 +1791,6 @@ static void ggml_mul_mat_vec_nc_f16_f32_sycl(
     const sycl::range<3> block_nums(nchannels_y, nrows_x, 1);
     const sycl::range<3> block_dims(1, 1, WARP_SIZE);
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
-
         stream->parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -3026,9 +3020,6 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
 
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
     queue_ptr queue = ctx.stream();
-
-    dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
-
     const sycl::half * src0_f16 = static_cast<const sycl::half *>(src0->data);
     float *            dst_ddf  = static_cast<float *>(dst->data);
 

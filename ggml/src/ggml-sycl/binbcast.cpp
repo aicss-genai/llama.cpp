@@ -220,9 +220,6 @@ struct bin_bcast_sycl {
                 // this is the maximum number of blocks in z direction, fallback to 1D grid kernel
                 int block_num = (ne0*ne1*ne2*ne3 + block_size - 1) / block_size;
                 {
-                    dpct::has_capability_or_fail(stream->get_device(),
-                                                 {sycl::aspect::fp16});
-
                     stream->parallel_for(
                         sycl::nd_range<3>(sycl::range<3>(1, 1, block_num) *
                                               sycl::range<3>(1, 1, block_size),
@@ -241,9 +238,6 @@ struct bin_bcast_sycl {
                 info::device::max_work_group_size. Adjust the work-group size if
                 needed.
                 */
-                dpct::has_capability_or_fail(stream->get_device(),
-                                             {sycl::aspect::fp16});
-
                 stream->parallel_for(
                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
                     [=](sycl::nd_item<3> item_ct1) {

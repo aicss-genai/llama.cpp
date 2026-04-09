@@ -199,8 +199,6 @@ static void ggml_cpy_f16_f32_sycl(const char * cx, char * cdst, const int ne, co
                                   const int nb12, const int nb13, queue_ptr stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-
         stream->parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
@@ -217,8 +215,6 @@ static void ggml_cpy_f32_f32_sycl(const char * cx, char * cdst, const int ne, co
                                   const int nb12, const int nb13, queue_ptr stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-
         stream->parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
@@ -235,8 +231,6 @@ static void ggml_cpy_f32_f16_sycl(const char * cx, char * cdst, const int ne, co
                                   const int nb12, const int nb13, queue_ptr stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-
         stream->parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
@@ -395,8 +389,6 @@ static void ggml_cpy_f16_f16_sycl(const char * cx, char * cdst, const int ne, co
                                   const int nb12, const int nb13, queue_ptr stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-
         stream->parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
@@ -413,9 +405,7 @@ static void ggml_cpy_i16_i16_sycl(const char * cx, char * cdst, const int ne, co
                                   const int nb12, const int nb13, queue_ptr stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
-        // dpct::has_capability_or_fail(stream->get_device(),
-        //                              {sycl::aspect::fp16});
-
+        //
         stream->parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
@@ -432,9 +422,7 @@ static void ggml_cpy_i32_i32_sycl(const char * cx, char * cdst, const int ne, co
                                   const int nb12, const int nb13, queue_ptr stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
-        // dpct::has_capability_or_fail(stream->get_device(),
-        //                              {sycl::aspect::fp16});
-
+        //
         stream->parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
                               sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
