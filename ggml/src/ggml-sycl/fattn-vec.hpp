@@ -340,13 +340,12 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         for (int j = 0; j < ncols; ++j) {
 #pragma unroll
             for (int offset = nthreads_KQ; offset < warp_size; offset <<= 1) {
-               KQ_max_new[j] = sycl::fmax(
-                  (float)KQ_max_new[j],
-                  (float)dpct::permute_sub_group_by_xor(
-                      sycl::ext::oneapi::this_work_item::get_sub_group(),
-                      KQ_max_new[j],
-                      offset,
-                      warp_size));
+               {
+                  const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+                  KQ_max_new[j] = sycl::fmax(
+                      (float)KQ_max_new[j],
+                      (float)sycl::select_from_group(sg, KQ_max_new[j], sg.get_local_linear_id() ^ offset));
+               }
             }
             const float KQ_max_scale = sycl::native::exp((float) (KQ_max[j] - KQ_max_new[j]));
             KQ_max[j] = KQ_max_new[j];

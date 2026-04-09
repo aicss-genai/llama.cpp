@@ -1524,7 +1524,7 @@ static void mul_mat_p021_f16_f32(
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
     }
 
     if (item_ct1.get_local_id(2) == 0) {
@@ -1576,7 +1576,7 @@ static void mul_mat_vec_nc_f16_f32( // nc == non-contiguous
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
     }
 
     if (item_ct1.get_local_id(2) == 0) {
@@ -3025,6 +3025,8 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
 
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
     queue_ptr queue = ctx.stream();
+
+
     const sycl::half * src0_f16 = static_cast<const sycl::half *>(src0->data);
     float *            dst_ddf  = static_cast<float *>(dst->data);
 
@@ -5093,10 +5095,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32;
-        case GGML_OP_ROLL:
-            return op->type == GGML_TYPE_F32;
-        case GGML_OP_ARANGE:
-            return op->type == GGML_TYPE_F32;
         case GGML_OP_SSM_SCAN: {
             if (op->src[3]->ne[0] == 1) {
                 return (op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256) && op->src[0]->ne[1] % WARP_SIZE == 0;
@@ -5110,6 +5108,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
+        case GGML_OP_ROLL:
+            return op->type == GGML_TYPE_F32;
+        case GGML_OP_ARANGE:
+            return op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_sycl_flash_attn_ext_supported(device, op);
         default:
