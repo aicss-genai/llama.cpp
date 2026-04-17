@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 THIRD_PARTY="${ROOT_DIR}/third_party"
-PATCHES_DIR="${ROOT_DIR}/patches"
+PATCHES_DIR="${ROOT_DIR}/patches_custom"
 
 LLAMA_REPO="https://github.com/ggml-org/llama.cpp"
 LLAMA_COMMIT="${LLAMA_COMMIT:-45cac7ca7}"

@@ -100,7 +100,7 @@ Clone llama.cpp and pti-gpu at the pinned commits. The scripts live in
 `aicss-genai/scripts/` — run them from the repository root:
 
 ```bash
-sudo rm -r third_party
+sudo rm -r ./aicss-genai/third_party
 ```
 
 ```bash
