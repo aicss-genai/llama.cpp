@@ -1,0 +1,480 @@
+From de883611a06259f38319e1ae033a6296b8d524a5 Mon Sep 17 00:00:00 2001
+From: unrahul <unrahul@users.noreply.archlinux.org>
+Date: Thu, 9 Apr 2026 11:42:38 -0700
+Subject: [PATCH] sycl: replace dpct::permute_sub_group_by_xor with native SYCL
+
+Replace all dpct shuffle wrappers with sycl::select_from_group across
+common.hpp (11 warp_reduce variants), mmvq.cpp (10), dmmv.cpp (7),
+ggml-sycl.cpp (2), fattn-common.hpp (2), fattn-vec.hpp (1).
+
+Also fix barrier() calls to use local_space fence (done in prior patch
+but included here for files that changed).
+
+This removes the last dpct dependency from the hot compute path.
+The dpct helper library is still linked for other utilities.
+
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 298fddc..2268ad4 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -430,80 +430,71 @@ struct ggml_backend_sycl_context {
+ // common device functions
+ 
+ static __dpct_inline__ float warp_reduce_sum(float x,
+-    const sycl::nd_item<3>& item_ct1) {
++    const sycl::nd_item<3> & item_ct1) {
++    const auto sg = item_ct1.get_sub_group();
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+-        x += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), x, mask);
++        x += sycl::select_from_group(sg, x, sg.get_local_linear_id() ^ mask);
+     }
+     return x;
+ }
+ 
+ static __dpct_inline__ sycl::float2
+-warp_reduce_sum(sycl::float2 a, const sycl::nd_item<3>& item_ct1) {
++warp_reduce_sum(sycl::float2 a, const sycl::nd_item<3> & item_ct1) {
++    const auto sg = item_ct1.get_sub_group();
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+-        a.x() += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), a.x(),
+-            mask);
+-        a.y() += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), a.y(),
+-            mask);
++        a.x() += sycl::select_from_group(sg, a.x(), sg.get_local_linear_id() ^ mask);
++        a.y() += sycl::select_from_group(sg, a.y(), sg.get_local_linear_id() ^ mask);
+     }
+     return a;
+ }
+ 
+-/* use WARP_SIZE or WARP_32_SIZE*/
+ template <int width>
+ static __dpct_inline__ int warp_reduce_sum(int x) {
+-  return sycl::reduce_over_group(
+-      sycl::ext::oneapi::this_work_item::get_sub_group(), x, sycl::plus<>());
++    return sycl::reduce_over_group(
++        sycl::ext::oneapi::this_work_item::get_sub_group(), x, sycl::plus<>());
+ }
+ 
+-/* use WARP_SIZE or WARP_32_SIZE*/
+ template <int width>
+ static __dpct_inline__ float warp_reduce_sum(float x) {
++    const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+ #pragma unroll
+-  for (int offset = width / 2; offset > 0; offset >>= 1) {
+-    x += dpct::permute_sub_group_by_xor(
+-        sycl::ext::oneapi::this_work_item::get_sub_group(), x, offset, width);
+-  }
+-  return x;
++    for (int offset = width / 2; offset > 0; offset >>= 1) {
++        x += sycl::select_from_group(sg, x, sg.get_local_linear_id() ^ offset);
++    }
++    return x;
+ }
+ 
+-/* use WARP_SIZE or WARP_32_SIZE*/
+ template <int width>
+-static __dpct_inline__ float warp_reduce_sum(float x, const sycl::nd_item<3>& item_ct1) {
++static __dpct_inline__ float warp_reduce_sum(float x, const sycl::nd_item<3> & item_ct1) {
++    const auto sg = item_ct1.get_sub_group();
+ #pragma unroll
+-  for (int offset = width / 2; offset > 0; offset >>= 1) {
+-    x += dpct::permute_sub_group_by_xor(
+-        item_ct1.get_sub_group(), x, offset);
+-  }
+-  return x;
++    for (int offset = width / 2; offset > 0; offset >>= 1) {
++        x += sycl::select_from_group(sg, x, sg.get_local_linear_id() ^ offset);
++    }
++    return x;
+ }
+ 
+-/* use WARP_SIZE or WARP_32_SIZE*/
+ template <int width>
+ static __dpct_inline__ sycl::float2 warp_reduce_sum(sycl::float2 a) {
++    const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+ #pragma unroll
+-  for (int offset = width / 2; offset > 0; offset >>= 1) {
+-    a.x() += dpct::permute_sub_group_by_xor(
+-        sycl::ext::oneapi::this_work_item::get_sub_group(), a.x(), offset,
+-        width);
+-    a.y() += dpct::permute_sub_group_by_xor(
+-        sycl::ext::oneapi::this_work_item::get_sub_group(), a.y(), offset,
+-        width);
+-  }
+-  return a;
++    for (int offset = width / 2; offset > 0; offset >>= 1) {
++        a.x() += sycl::select_from_group(sg, a.x(), sg.get_local_linear_id() ^ offset);
++        a.y() += sycl::select_from_group(sg, a.y(), sg.get_local_linear_id() ^ offset);
++    }
++    return a;
+ }
+ 
+-/* use WARP_SIZE or WARP_32_SIZE*/
+ template <int width>
+ static __dpct_inline__ sycl::half2 warp_reduce_sum(sycl::half2 a) {
++    const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+ #pragma unroll
+-  for (int offset = width / 2; offset > 0; offset >>= 1) {
+-    a = a + dpct::permute_sub_group_by_xor(
+-                sycl::ext::oneapi::this_work_item::get_sub_group(), a, offset,
+-                width);
+-  }
+-  return a;
++    for (int offset = width / 2; offset > 0; offset >>= 1) {
++        a = a + sycl::select_from_group(sg, a, sg.get_local_linear_id() ^ offset);
++    }
++    return a;
+ }
+ 
+ static constexpr int ggml_sycl_get_physical_warp_size() {
+@@ -511,68 +502,50 @@ static constexpr int ggml_sycl_get_physical_warp_size() {
+   return WARP_SIZE;
+ }
+ 
+-/* use WARP_SIZE or WARP_32_SIZE*/
+ template <int width>
+ static __dpct_inline__ int warp_reduce_all(int x) {
+-    if (width == ggml_sycl_get_physical_warp_size()) {
+-        return sycl::all_of_group(
+-            sycl::ext::oneapi::this_work_item::get_sub_group(),
+-            (~0xffffffff &
+-             (0x1 << sycl::ext::oneapi::this_work_item::get_sub_group()
+-                         .get_local_linear_id())) ||
+-                x);
++    const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
++    if constexpr (width == WARP_SIZE) {
++        return sycl::all_of_group(sg, x != 0);
+     } else {
+ #pragma unroll
+         for (int offset = width / 2; offset > 0; offset >>= 1) {
+-            x = dpct::permute_sub_group_by_xor(
+-                    sycl::ext::oneapi::this_work_item::get_sub_group(), x,
+-                    offset, width) &&
+-                x;
++            x = sycl::select_from_group(sg, x, sg.get_local_linear_id() ^ offset) && x;
+         }
+         return x;
+     }
+ }
+ 
+-/* use WARP_SIZE or WARP_32_SIZE*/
+ template <int width>
+ static __dpct_inline__ int warp_reduce_any(int x) {
+-    if (width == ggml_sycl_get_physical_warp_size()) {
+-        return sycl::any_of_group(
+-            sycl::ext::oneapi::this_work_item::get_sub_group(),
+-            (0xffffffff &
+-             (0x1 << sycl::ext::oneapi::this_work_item::get_sub_group()
+-                         .get_local_linear_id())) &&
+-                x);
++    const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
++    if constexpr (width == WARP_SIZE) {
++        return sycl::any_of_group(sg, x != 0);
+     } else {
+ #pragma unroll
+         for (int offset = width / 2; offset > 0; offset >>= 1) {
+-            x = dpct::permute_sub_group_by_xor(
+-                    sycl::ext::oneapi::this_work_item::get_sub_group(), x,
+-                    offset, width) ||
+-                x;
++            x = sycl::select_from_group(sg, x, sg.get_local_linear_id() ^ offset) || x;
+         }
+         return x;
+     }
+ }
+ 
+-/* use WARP_SIZE or WARP_32_SIZE*/
+ template <int width>
+ static __dpct_inline__ float warp_reduce_max(float x) {
++    const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+ #pragma unroll
+-  for (int offset = width / 2; offset > 0; offset >>= 1) {
+-    x = sycl::fmax(x, dpct::permute_sub_group_by_xor(
+-                          sycl::ext::oneapi::this_work_item::get_sub_group(), x,
+-                          offset, width));
+-  }
+-  return x;
++    for (int offset = width / 2; offset > 0; offset >>= 1) {
++        x = sycl::fmax(x, sycl::select_from_group(sg, x, sg.get_local_linear_id() ^ offset));
++    }
++    return x;
+ }
+ 
+ static __dpct_inline__ float warp_reduce_max(float x,
+-    const sycl::nd_item<3>& item_ct1) {
++    const sycl::nd_item<3> & item_ct1) {
++    const auto sg = item_ct1.get_sub_group();
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+-        x = sycl::fmax(x, dpct::permute_sub_group_by_xor(
+-            item_ct1.get_sub_group(), x, mask));
++        x = sycl::fmax(x, sycl::select_from_group(sg, x, sg.get_local_linear_id() ^ mask));
+     }
+     return x;
+ }
+diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
+index 9be16eb..d8ca188 100644
+--- a/ggml/src/ggml-sycl/dmmv.cpp
++++ b/ggml/src/ggml-sycl/dmmv.cpp
+@@ -78,7 +78,7 @@ static void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat *
+     const int mask_start = ncols > GGML_SYCL_DMMV_X ? WARP_SIZE >> 1 : WARP_SIZE >> 2;
+     for (int mask = mask_start; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (tid == 0) {
+@@ -184,7 +184,7 @@ static void dequantize_mul_mat_vec_reorder(const void * __restrict__ vx, const d
+     const int mask_start = ncols > GGML_SYCL_DMMV_X ? WARP_SIZE >> 1 : WARP_SIZE >> 2;
+     for (int mask = mask_start; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (tid == 0) {
+@@ -332,7 +332,7 @@ static void dequantize_mul_mat_vec_q2_k(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -451,7 +451,7 @@ static void dequantize_mul_mat_vec_q3_k(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -604,7 +604,7 @@ static void dequantize_mul_mat_vec_q4_k(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (tid == 0) {
+@@ -738,7 +738,7 @@ static void dequantize_mul_mat_vec_q5_k(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -853,7 +853,7 @@ static void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx, const floa
+ #pragma unroll
+     for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (tid == 0) {
+diff --git a/ggml/src/ggml-sycl/fattn-common.hpp b/ggml/src/ggml-sycl/fattn-common.hpp
+index 9934c21..8ffdf84 100644
+--- a/ggml/src/ggml-sycl/fattn-common.hpp
++++ b/ggml/src/ggml-sycl/fattn-common.hpp
+@@ -316,8 +316,8 @@ static __dpct_inline__ void quantize_q8_1_to_shared(const float * __restrict__ x
+ #pragma unroll
+     for (int mask = QI8_1/2; mask > 0; mask >>= 1) {
+         amax = sycl::fmax(
+-            amax, dpct::permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), amax, mask));
+-        sum += dpct::permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), sum, mask);
++            amax, sycl::select_from_group(sycl::ext::oneapi::this_work_item::get_sub_group(), amax, sycl::ext::oneapi::this_work_item::get_sub_group().get_local_linear_id() ^ mask));
++        sum += sycl::select_from_group(sycl::ext::oneapi::this_work_item::get_sub_group(), sum, sycl::ext::oneapi::this_work_item::get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     const float d = amax / 127;
+@@ -1020,6 +1020,7 @@ void launch_fattn(
+ 
+         KV_max.alloc(ne_KV_max);
+         {
++
+             main_stream->submit([&](sycl::handler & cgh) {
+                 sycl::local_accessor<int, 1> buf_iw_acc_ct1(sycl::range<1>(warp_size), cgh);
+ 
+diff --git a/ggml/src/ggml-sycl/fattn-vec.hpp b/ggml/src/ggml-sycl/fattn-vec.hpp
+index 48c3890..df1eb44 100644
+--- a/ggml/src/ggml-sycl/fattn-vec.hpp
++++ b/ggml/src/ggml-sycl/fattn-vec.hpp
+@@ -340,13 +340,12 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
+         for (int j = 0; j < ncols; ++j) {
+ #pragma unroll
+             for (int offset = nthreads_KQ; offset < warp_size; offset <<= 1) {
+-               KQ_max_new[j] = sycl::fmax(
+-                  (float)KQ_max_new[j],
+-                  (float)dpct::permute_sub_group_by_xor(
+-                      sycl::ext::oneapi::this_work_item::get_sub_group(),
+-                      KQ_max_new[j],
+-                      offset,
+-                      warp_size));
++               {
++                  const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
++                  KQ_max_new[j] = sycl::fmax(
++                      (float)KQ_max_new[j],
++                      (float)sycl::select_from_group(sg, KQ_max_new[j], sg.get_local_linear_id() ^ offset));
++               }
+             }
+             const float KQ_max_scale = sycl::native::exp((float) (KQ_max[j] - KQ_max_new[j]));
+             KQ_max[j] = KQ_max_new[j];
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 90a0ee1..7c174da 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -1501,7 +1501,7 @@ static void mul_mat_p021_f16_f32(
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -1553,7 +1553,7 @@ static void mul_mat_vec_nc_f16_f32( // nc == non-contiguous
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -3002,6 +3002,8 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
+ 
+     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+     queue_ptr queue = ctx.stream();
++
++
+     const sycl::half * src0_f16 = static_cast<const sycl::half *>(src0->data);
+     float *            dst_ddf  = static_cast<float *>(dst->data);
+ 
+@@ -5005,10 +5007,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
+             return op->type == GGML_TYPE_F32 &&
+                    op->src[0]->type == GGML_TYPE_F32 &&
+                    op->src[1]->type == GGML_TYPE_F32;
+-        case GGML_OP_ROLL:
+-            return op->type == GGML_TYPE_F32;
+-        case GGML_OP_ARANGE:
+-            return op->type == GGML_TYPE_F32;
+         case GGML_OP_SSM_SCAN: {
+             if (op->src[3]->ne[0] == 1) {
+                 return (op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256) && op->src[0]->ne[1] % WARP_SIZE == 0;
+@@ -5023,6 +5021,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
+             return true;
+         case GGML_OP_SOLVE_TRI:
+             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
++        case GGML_OP_ROLL:
++            return op->type == GGML_TYPE_F32;
++        case GGML_OP_ARANGE:
++            return op->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_sycl_flash_attn_ext_supported(device, op);
+         default:
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 5739cdb..239099c 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -92,7 +92,7 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
+     // sum up partial sums and write back result
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+-        tmp += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++        tmp += sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -141,7 +141,7 @@ static void mul_mat_vec_q_iq2_xxs_q8_1(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -189,7 +189,7 @@ static void mul_mat_vec_q_iq2_xs_q8_1(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -237,7 +237,7 @@ static void mul_mat_vec_q_iq2_s_q8_1(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -285,7 +285,7 @@ static void mul_mat_vec_q_iq3_xxs_q8_1(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -333,7 +333,7 @@ static void mul_mat_vec_q_iq3_s_q8_1(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -381,7 +381,7 @@ static void mul_mat_vec_q_iq1_s_q8_1(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -429,7 +429,7 @@ static void mul_mat_vec_q_iq1_m_q8_1(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -477,7 +477,7 @@ static void mul_mat_vec_q_iq4_nl_q8_1(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+@@ -526,7 +526,7 @@ static void mul_mat_vec_q_iq4_xs_q8_1(const void *__restrict__ vx,
+ #pragma unroll
+     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+         tmp +=
+-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
++            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
+     }
+ 
+     if (item_ct1.get_local_id(2) == 0) {
+-- 
+2.53.0
+

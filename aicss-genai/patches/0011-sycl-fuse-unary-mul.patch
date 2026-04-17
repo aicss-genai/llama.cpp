@@ -1,0 +1,86 @@
+From ea58ed45e0c82b1f2d0e179d538577b7b465b54e Mon Sep 17 00:00:00 2001
+From: unrahul <unrahul@users.noreply.archlinux.org>
+Date: Thu, 9 Apr 2026 12:23:35 -0700
+Subject: [PATCH] sycl: fuse UNARY(SiLU/sigmoid/softplus)+MUL via graph
+ detection
+
+Combine activation function with element-wise gate multiply into a
+single kernel launch. Only fuses when both operands have the same
+shape (no broadcast). Saves one kernel launch per fused pair.
+
+Matches CUDA's ggml_cuda_op_unary_mul pattern.
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 67ac85f..a8a6c10 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -2871,6 +2871,45 @@ static void ggml_sycl_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * ds
+     ggml_sycl_op_rms_norm(ctx, dst);
+ }
+ 
++static void ggml_sycl_op_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
++    const ggml_tensor * unary_src = unary_node->src[0];
++    const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
++
++    GGML_ASSERT(ggml_are_same_shape(unary_src, other_src));
++    GGML_ASSERT(unary_src->type == GGML_TYPE_F32);
++
++    dpct::queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++
++    const float * src_d   = static_cast<const float *>(unary_src->data);
++    const float * other_d = static_cast<const float *>(other_src->data);
++    float * dst_d         = static_cast<float *>(mul_node->data);
++    const int64_t k       = ggml_nelements(mul_node);
++
++    const auto op = ggml_get_unary_op(unary_node);
++
++    stream->parallel_for(sycl::range<1>(k), [=](sycl::id<1> idx) {
++        const int64_t i = idx[0];
++        const float x = src_d[i];
++        float activated;
++        switch (op) {
++            case GGML_UNARY_OP_SILU:
++                activated = x / (1.0f + sycl::native::exp(-x));
++                break;
++            case GGML_UNARY_OP_SIGMOID:
++                activated = 1.0f / (1.0f + sycl::native::exp(-x));
++                break;
++            case GGML_UNARY_OP_SOFTPLUS:
++                activated = x > 20.0f ? x : sycl::log1p(sycl::native::exp(x));
++                break;
++            default:
++                activated = x;
++                break;
++        }
++        dst_d[i] = activated * other_d[i];
++    });
++}
++
+ static void ggml_sycl_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+     ggml_sycl_op_rms_norm_back(ctx, dst);
+@@ -4466,6 +4505,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             continue;
+         }
+ 
++        if (node->op == GGML_OP_UNARY &&
++            (ggml_get_unary_op(node) == GGML_UNARY_OP_SILU ||
++             ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID ||
++             ggml_get_unary_op(node) == GGML_UNARY_OP_SOFTPLUS) &&
++            ggml_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
++            ggml_tensor * mul_node = cgraph->nodes[i + 1];
++            const ggml_tensor * other = (mul_node->src[0] == node) ? mul_node->src[1] : mul_node->src[0];
++            if (ggml_are_same_shape(node->src[0], other)) {
++                ggml_sycl_op_unary_mul(*sycl_ctx, node, mul_node);
++                i++;
++                continue;
++            }
++        }
++
+ #ifndef NDEBUG
+         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
+         for (int j = 0; j < GGML_MAX_SRC; j++) {
+-- 
+2.53.0
+

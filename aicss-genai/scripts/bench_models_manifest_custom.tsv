@@ -1,0 +1,3 @@
+name	expected_size	url
+Llama-3.1-8B-Q4	4920739232	https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf?download=true
+Qwen3.5-9B-Q4	5680522464	https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true

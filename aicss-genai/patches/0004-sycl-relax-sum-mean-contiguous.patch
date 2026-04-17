@@ -1,0 +1,49 @@
+From d6797b19d817ae4b56ac3710b3900ca333fbf824 Mon Sep 17 00:00:00 2001
+From: unrahul <unrahul@users.noreply.archlinux.org>
+Date: Thu, 9 Apr 2026 10:59:02 -0700
+Subject: [PATCH 03/10] sycl: relax SUM/SUM_ROWS/MEAN to
+ ggml_is_contiguous_rows
+
+Match CUDA behavior. These reduction ops work correctly on
+row-contiguous tensors (columns may have stride). The stricter
+ggml_is_contiguous check was a SYCLomatic artifact.
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 846476e..69eec9f 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -3940,19 +3940,19 @@ static void ggml_sycl_im2col(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
+ 
+ static void ggml_sycl_sum(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+-    GGML_ASSERT(ggml_is_contiguous(dst->src[0]));
++    GGML_ASSERT(ggml_is_contiguous_rows(dst->src[0]));
+     ggml_sycl_op_sum(ctx, dst);
+ }
+ 
+ static void ggml_sycl_sum_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+-    GGML_ASSERT(ggml_is_contiguous(dst->src[0]));
++    GGML_ASSERT(ggml_is_contiguous_rows(dst->src[0]));
+     ggml_sycl_op_sum_rows(ctx, dst);
+ }
+ 
+ static void ggml_sycl_mean(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+-    GGML_ASSERT(ggml_is_contiguous(dst->src[0]));
++    GGML_ASSERT(ggml_is_contiguous_rows(dst->src[0]));
+     ggml_sycl_op_mean(ctx, dst);
+ }
+ 
+@@ -4942,7 +4942,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_SUM:
+         case GGML_OP_SUM_ROWS:
+         case GGML_OP_MEAN:
+-            return ggml_is_contiguous(op->src[0]);
++            return ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_ARGSORT:
+             return op->src[0]->ne[0] * sizeof(int) <=
+                    ggml_sycl_info().devices[device].smpbo;
+-- 
+2.53.0
+
