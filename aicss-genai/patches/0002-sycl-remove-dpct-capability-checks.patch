@@ -1,4 +1,4 @@
-From e9d13e78a8a61bbcf4db159ff6bae690c966c73d Mon Sep 17 00:00:00 2001
+From 1217fd5e30f96ebc9f1b2f0cbd9ba74e981ae0e9 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 10:58:37 -0700
 Subject: [PATCH 02/12] sycl: remove redundant dpct::has_capability_or_fail

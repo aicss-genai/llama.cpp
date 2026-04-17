@@ -1,4 +1,4 @@
-From a6b588659b9271c437360e71ff97a0d645d4746c Mon Sep 17 00:00:00 2001
+From 18cb45d1dc0915bec69ab102dad05036dd924186 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 12:39:50 -0700
 Subject: [PATCH 12/12] sycl: extend graph fusion (RMS_NORM+MUL+ADD, UNARY+MUL)
@@ -17,10 +17,10 @@ Both match CUDA backend fusion patterns.
  3 files changed, 98 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index c7c632db9..b331a13b7 100644
+index d5cbfb152..7eee116c1 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -4567,6 +4567,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -4572,6 +4572,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  

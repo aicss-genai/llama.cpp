@@ -1,4 +1,4 @@
-From 9e53fe27d02f730facceceb7a36db84fcad04358 Mon Sep 17 00:00:00 2001
+From 771b777e23e6baa0134b2af4f4d0c3efffcebb64 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 10:59:02 -0700
 Subject: [PATCH 04/12] sycl: relax SUM/SUM_ROWS/MEAN to

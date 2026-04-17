@@ -1,4 +1,4 @@
-From f0b9b299bfda12ad585653a4ce0e0ca081a72f5b Mon Sep 17 00:00:00 2001
+From 6acae06c3fd4a85a9d8daac63f9c812a967dad17 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 12:23:35 -0700
 Subject: [PATCH 11/12] sycl: fuse UNARY(SiLU/sigmoid/softplus)+MUL via graph
@@ -14,7 +14,7 @@ Matches CUDA's ggml_cuda_op_unary_mul pattern.
  1 file changed, 53 insertions(+)
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 10ac3bc8f..c7c632db9 100644
+index a2164808d..d5cbfb152 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -2894,6 +2894,45 @@ static void ggml_sycl_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * ds
@@ -63,7 +63,7 @@ index 10ac3bc8f..c7c632db9 100644
  static void ggml_sycl_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
      ggml_sycl_op_rms_norm_back(ctx, dst);
-@@ -4535,6 +4574,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -4540,6 +4579,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  

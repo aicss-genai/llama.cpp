@@ -1,4 +1,4 @@
-From 526e6c5fa049b1977238ae3c8ecbe6db5890bd4c Mon Sep 17 00:00:00 2001
+From d28d945c649fa54ae6c84e2a098d547441b3e3ac Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 11:23:26 -0700
 Subject: [PATCH 07/12] sycl: add local_space fence to all barrier calls

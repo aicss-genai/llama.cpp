@@ -1,4 +1,4 @@
-From ed657bc38bfbec7f1847d78182db6853fd770372 Mon Sep 17 00:00:00 2001
+From 9f0fb752f815a5de03284b181b338eeb80ecde66 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 11:09:42 -0700
 Subject: [PATCH 06/12] add FILL, CUMSUM, DIAG, SOLVE_TRI, SSM_SCAN,

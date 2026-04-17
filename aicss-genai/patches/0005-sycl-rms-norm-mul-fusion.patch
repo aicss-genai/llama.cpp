@@ -1,4 +1,4 @@
-From 858eb9a954434cafe38270800501da21fe795ce3 Mon Sep 17 00:00:00 2001
+From 169248686aa9f6282102a97db479049fc286d394 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 10:59:16 -0700
 Subject: [PATCH 05/12] sycl: fuse RMS_NORM+MUL via graph-level detection

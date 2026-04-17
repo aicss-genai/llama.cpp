@@ -1,4 +1,4 @@
-From 2acb153ffa360187a9441f8b619c3dc4cc1940c1 Mon Sep 17 00:00:00 2001
+From e4feb05f74c0ccf4b06b2fe09bbc7767b88d1692 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 10:58:50 -0700
 Subject: [PATCH 03/12] sycl: support non-contiguous input in PAD op

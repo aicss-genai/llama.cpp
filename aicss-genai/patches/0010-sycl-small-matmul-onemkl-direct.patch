@@ -1,4 +1,4 @@
-From e45539a9337f5d18018d9d8b4b3e06dfb22d1a19 Mon Sep 17 00:00:00 2001
+From d0f6408fadeb8920d07c92fa6b1eb51be2186474 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 12:06:10 -0700
 Subject: [PATCH 10/12] sycl: route small f32 matmuls to oneMKL, bypass oneDNN
@@ -20,7 +20,7 @@ Verified: Qwen3.5-9B pp512 813->977 (+20%), Llama unchanged.
  1 file changed, 17 insertions(+), 13 deletions(-)
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 362652081..10ac3bc8f 100644
+index 7b84c4513..a2164808d 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -2248,21 +2248,25 @@ inline void ggml_sycl_op_mul_mat_sycl(

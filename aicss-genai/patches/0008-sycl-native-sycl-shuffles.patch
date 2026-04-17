@@ -1,4 +1,4 @@
-From 8291debfa8dfdaa9a66d7a609d4dc1cffc51ce3c Mon Sep 17 00:00:00 2001
+From 54b7668ae1e84efb31bbffdbddfadfccf4268381 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 11:42:38 -0700
 Subject: [PATCH 08/12] sycl: replace dpct::permute_sub_group_by_xor with
@@ -391,7 +391,7 @@ index ee0a6e39b..e41d42bf2 100644
              return ggml_sycl_flash_attn_ext_supported(device, op);
          default:
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index 75d9f040a..45f92e7c4 100644
+index 13fe605ec..97b40f8e4 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
 @@ -92,7 +92,7 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
