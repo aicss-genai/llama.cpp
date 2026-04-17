@@ -1,11 +1,11 @@
 # SYCL Kernel Patches for Intel Arc Pro (Battlemage)
 
-Base commit: llama.cpp `4d99d45`
+Base commit: llama.cpp `45cac7ca7`
 Target: Intel Arc Pro B70 (Xe2-HPG, BMG-G31, 256 EUs, SIMD16)
 Container: `intel/llm-scaler-vllm:0.14.0-b8.1` (oneAPI 2025.2.2)
 
 On the `aicss-genai-fork` branch these patches are already applied as
-individual commits on top of `4d99d45` — you can build the branch
+individual commits on top of `45cac7ca7` — you can build the branch
 directly without running `apply.sh`. The patch files in this directory
 are kept for reference and for users who want to apply them to a fresh
 upstream checkout.
@@ -17,7 +17,7 @@ Applying to a fresh upstream llama.cpp checkout:
 ```bash
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 4d99d45
+git checkout 45cac7ca7
 bash /path/to/aicss-genai/patches/apply.sh .
 
 cmake -B build \
@@ -55,7 +55,7 @@ cmake --build build -j$(nproc)
 ```bash
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 4d99d45
+git checkout 45cac7ca7
 bash /path/to/aicss-genai/patches/apply.sh .
 
 cmake -B build \

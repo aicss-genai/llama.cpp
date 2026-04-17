@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${LLAMA_PROFILER_IMAGE:-llama-sycl-profiler:0.14.0-b7.1-4d99d45}"
+IMAGE="${LLAMA_PROFILER_IMAGE:-llama-sycl-profiler:0.14.0-b8.1-45cac7ca7}"
 MODELS_DIR="${LLAMA_MODELS_DIR:-${ROOT_DIR}/models}"
 MODEL_PATH="${1:-${MODELS_DIR}/Qwen3.5-9B-Q4.gguf}"
 TIMESTAMP="$(date +%Y-%m-%dT%H-%M-%S)-$$"

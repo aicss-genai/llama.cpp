@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PTI_DIR="${ROOT_DIR}/third_party/pti-gpu/tools/unitrace"
-LLAMA_COMMIT="${LLAMA_COMMIT:-4d99d45}"
+LLAMA_COMMIT="${LLAMA_COMMIT:-45cac7ca7}"
 IMAGE="${UNITRACE_BUILD_IMAGE:-llama-sycl-local:0.14.0-b8.1-${LLAMA_COMMIT}}"
 BUILD_DIR="${PTI_DIR}/build"
 BUILD_TYPE="${UNITRACE_BUILD_TYPE:-Release}"

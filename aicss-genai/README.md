@@ -1,7 +1,7 @@
 # aicss-genai-fork — llama.cpp SYCL Optimization for Intel Arc GPUs
 
 A downstream llama.cpp fork that ports the `llamacpp-sycl-bmg` SYCL
-optimizations directly on top of upstream commit `4d99d45`. The SYCL
+optimizations directly on top of upstream commit `45cac7ca7`. The SYCL
 kernel patches are already applied as individual commits on this branch —
 you can build and run the fork directly.
 
@@ -111,14 +111,14 @@ LLAMA_BENCH_CONFIG=optimized ./aicss-genai/scripts/setup_third_party.sh
 LLAMA_BENCH_CONFIG=baseline ./aicss-genai/scripts/setup_third_party.sh
 ```
 
-This creates `third_party/llama.cpp` (@ `4d99d45`) and
+This creates `third_party/llama.cpp` (@ `45cac7ca7`) and
 `third_party/pti-gpu` (@ `044440c`). When `LLAMA_BENCH_CONFIG=baseline`,
 patches are skipped so the source tree stays identical to upstream. If
 the repos already exist, the script skips the clone and warns on commit
 mismatch.
 
 Tip: the current fork branch itself already has the patches applied on
-top of `4d99d45`. The `third_party/` workflow is intended for running
+top of `45cac7ca7`. The `third_party/` workflow is intended for running
 A/B comparisons against an unpatched tree without affecting the fork
 checkout.
 
@@ -410,7 +410,7 @@ Set automatically by `build_llama_sycl_container.sh`:
 
 ### Kernel patches (source)
 
-Applied to `ggml/src/ggml-sycl/` on top of commit `4d99d45`. On this
+Applied to `ggml/src/ggml-sycl/` on top of commit `45cac7ca7`. On this
 branch the patches are already applied as individual commits; the
 verbatim patch files are preserved in `aicss-genai/patches/` for
 reference and for downstream consumers who want to apply them to an
@@ -439,7 +439,7 @@ To apply manually to a separate llama.cpp checkout:
 ```bash
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 4d99d45
+git checkout 45cac7ca7
 bash /path/to/aicss-genai/patches/apply.sh .
 ```
 

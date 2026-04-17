@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLAMA_DIR="${1:-.}"
-BASE_COMMIT="4d99d45"
+BASE_COMMIT="45cac7ca7"
 
 cd "$LLAMA_DIR"
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LLAMA_COMMIT="${LLAMA_COMMIT:-4d99d45}"
+LLAMA_COMMIT="${LLAMA_COMMIT:-45cac7ca7}"
 BASE_IMAGE="${LLAMA_PROFILER_BASE_IMAGE:-llama-sycl-local:0.14.0-b8.1-${LLAMA_COMMIT}}"
 UNITRACE_BUILD_DIR="${ROOT_DIR}/third_party/pti-gpu/tools/unitrace/build"
 TARGET_IMAGE="${LLAMA_PROFILER_IMAGE:-llama-sycl-profiler:0.14.0-b8.1-${LLAMA_COMMIT}}"

@@ -6,7 +6,7 @@ THIRD_PARTY="${ROOT_DIR}/third_party"
 PATCHES_DIR="${ROOT_DIR}/patches"
 
 LLAMA_REPO="https://github.com/ggml-org/llama.cpp"
-LLAMA_COMMIT="${LLAMA_COMMIT:-d006858}"
+LLAMA_COMMIT="${LLAMA_COMMIT:-45cac7ca7}"
 
 PTI_REPO="https://github.com/intel/pti-gpu.git"
 PTI_COMMIT="${PTI_COMMIT:-044440c}"
