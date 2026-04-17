@@ -393,47 +393,6 @@ device-scope events, batch sizes) against the baseline:
 Results go to `results/<date-time>-l0-ab/` with a `summary.txt`
 comparing all variants.
 
-### 8. Large-Token SYCL Graph A/B
-
-Use this flow when comparing graph-disabled and graph-enabled runs at
-larger decode token counts.
-
-1) Set benchmark token shapes for large decode runs:
-
-```bash
-export LLAMA_BENCH_PROMPT_TOKENS=512
-export LLAMA_BENCH_GEN_TOKENS=1024,2048,4096,8192
-export LLAMA_BENCH_REPS=3
-```
-
-Note: `16384` decode tokens was tested and is typically prohibitively
-expensive for routine A/B sweeps on this setup.
-
-2) Run the full model sweep without and with SYCL graph replay:
-
-```bash
-LLAMA_BENCH_GPU_IDS=0,1 GGML_SYCL_DISABLE_GRAPH=1 ./aicss-genai/scripts/bench_all_models_parallel_gpu.sh
-LLAMA_BENCH_GPU_IDS=2,3 GGML_SYCL_DISABLE_GRAPH=0 ./aicss-genai/scripts/bench_all_models_parallel_gpu.sh
-```
-
-3) Optional: merge these runs with earlier results that used default
-`LLAMA_BENCH_*` token settings:
-
-```bash
-./aicss-genai/scripts/merge_results_dirs.py -o results/without_sycl_graph results/<timestamp A> results/<timestamp B>
-./aicss-genai/scripts/merge_results_dirs.py -o results/with_sycl_graph results/<timestamp C> results/<timestamp D>
-```
-
-4) Generate a comparison plot:
-
-```bash
-./aicss-genai/scripts/plot_ab_results.py \
-    --title "SYCL Graph Replay Comparison" \
-    --a "Without graphs=results/without_sycl_graph" \
-    --b "With graphs=results/with_sycl_graph" \
-    -o sycl_graph_comparison.svg
-```
-
 ## Key Optimizations
 
 Two layers of optimization, both required for the full speedup.
