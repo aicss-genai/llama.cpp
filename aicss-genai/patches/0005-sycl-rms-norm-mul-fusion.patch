@@ -1,7 +1,7 @@
-From ee6039747dcf74bf39735f20cb87ea8b2b92895a Mon Sep 17 00:00:00 2001
+From 858eb9a954434cafe38270800501da21fe795ce3 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 10:59:16 -0700
-Subject: [PATCH 04/10] sycl: fuse RMS_NORM+MUL via graph-level detection
+Subject: [PATCH 05/12] sycl: fuse RMS_NORM+MUL via graph-level detection
 
 Combine RMS normalization with element-wise weight multiply into a
 single kernel, eliminating one kernel launch and one full-tensor
@@ -9,12 +9,17 @@ memory round-trip per transformer layer. Uses ggml_can_fuse() for
 {RMS_NORM, MUL} sequence detection (same mechanism as CUDA backend).
 
 Verified: tg128 +5.5% on Qwen3.5-9B Q4_K_M, Intel Arc Pro B70.
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp |   8 ++
+ ggml/src/ggml-sycl/norm.cpp      | 144 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-sycl/norm.hpp      |   2 +
+ 3 files changed, 154 insertions(+)
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 69eec9f..1ce2904 100644
+index 99c605b39..70793704b 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -4428,6 +4428,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -4523,6 +4523,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
              continue;
          }
@@ -30,7 +35,7 @@ index 69eec9f..1ce2904 100644
          assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
          for (int j = 0; j < GGML_MAX_SRC; j++) {
 diff --git a/ggml/src/ggml-sycl/norm.cpp b/ggml/src/ggml-sycl/norm.cpp
-index 00702b5..f61412f 100644
+index 09fce1280..8612eea75 100644
 --- a/ggml/src/ggml-sycl/norm.cpp
 +++ b/ggml/src/ggml-sycl/norm.cpp
 @@ -202,6 +202,62 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols, const int6
@@ -93,10 +98,10 @@ index 00702b5..f61412f 100644
 +    }
 +}
 +
- static void l2_norm_f32(const float* x, float* dst, const int ncols, const float eps,
-     const sycl::nd_item<3>& item_ct1, float* s_sum, int block_size) {
-     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
-@@ -369,6 +425,41 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
+ template<int warp_size>
+ static void l2_norm_f32(const float * x, float * dst, const int ncols,
+     const int64_t stride_row, const int64_t stride_channel,
+@@ -356,6 +412,41 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
      }
  }
  
@@ -135,10 +140,10 @@ index 00702b5..f61412f 100644
 +    }
 +}
 +
- static void l2_norm_f32_sycl(const float* x, float* dst, const int ncols,
-     const int nrows, const float eps,
-     queue_ptr stream, int device) {
-@@ -477,6 +568,59 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+ template<int warp_size>
+ static void l2_norm_f32_sycl(const float *   x,
+                              float *         dst,
+@@ -472,6 +563,59 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
      rms_norm_f32_sycl(src0_dd, dst_dd, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
  }
  
@@ -199,7 +204,7 @@ index 00702b5..f61412f 100644
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
 diff --git a/ggml/src/ggml-sycl/norm.hpp b/ggml/src/ggml-sycl/norm.hpp
-index 8cb885e..773ab1f 100644
+index 8cb885eb2..773ab1f51 100644
 --- a/ggml/src/ggml-sycl/norm.hpp
 +++ b/ggml/src/ggml-sycl/norm.hpp
 @@ -19,6 +19,8 @@ void ggml_sycl_op_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
@@ -212,5 +217,5 @@ index 8cb885e..773ab1f 100644
  
  void ggml_sycl_op_group_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
 -- 
-2.53.0
+2.48.1
 

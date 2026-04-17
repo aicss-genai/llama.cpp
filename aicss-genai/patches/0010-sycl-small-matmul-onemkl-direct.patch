@@ -1,7 +1,7 @@
-From 018702d5d37b9d80515832a0075e129d5431daa4 Mon Sep 17 00:00:00 2001
+From e45539a9337f5d18018d9d8b4b3e06dfb22d1a19 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 12:06:10 -0700
-Subject: [PATCH] sycl: route small f32 matmuls to oneMKL, bypass oneDNN
+Subject: [PATCH 10/12] sycl: route small f32 matmuls to oneMKL, bypass oneDNN
 
 For matmuls where M*N*K < 16.7M flops, use oneMKL gemm directly
 instead of creating an oneDNN matmul primitive. oneDNN primitive
@@ -15,12 +15,15 @@ Large matmuls (Llama weight projections) still use oneDNN which has
 better XMX utilization for those sizes.
 
 Verified: Qwen3.5-9B pp512 813->977 (+20%), Llama unchanged.
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 30 +++++++++++++++++-------------
+ 1 file changed, 17 insertions(+), 13 deletions(-)
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 72fa2b1..67ac85f 100644
+index 362652081..10ac3bc8f 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -2225,21 +2225,25 @@ inline void ggml_sycl_op_mul_mat_sycl(
+@@ -2248,21 +2248,25 @@ inline void ggml_sycl_op_mul_mat_sycl(
          const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
          const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
  
@@ -60,5 +63,5 @@ index 72fa2b1..67ac85f 100644
      }
      GGML_UNUSED(dst);
 -- 
-2.53.0
+2.48.1
 

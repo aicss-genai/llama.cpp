@@ -1,7 +1,7 @@
-From 6858c0b9e42043aea7175dad65ee727a8af40756 Mon Sep 17 00:00:00 2001
+From 2acb153ffa360187a9441f8b619c3dc4cc1940c1 Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 10:58:50 -0700
-Subject: [PATCH 02/10] sycl: support non-contiguous input in PAD op
+Subject: [PATCH 03/12] sycl: support non-contiguous input in PAD op
 
 Add stride-based indexing to the PAD kernel, matching CUDA and Vulkan
 behavior. The previous flat indexing required ggml_is_contiguous(src)
@@ -9,14 +9,18 @@ which caused 360 CPU fallbacks per forward pass on models using
 permute+pad (Delta Net chunked attention in Qwen3.5-9B).
 
 Verified: pp512 344->474 tok/s (+38%) on Qwen3.5-9B Q4_K_M.
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp |  3 +-
+ ggml/src/ggml-sycl/pad.cpp       | 54 ++++++++++++++++----------------
+ 2 files changed, 28 insertions(+), 29 deletions(-)
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 2d41a5c..846476e 100644
+index d01281a7c..b33d0e62b 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -4959,11 +4959,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5050,11 +5050,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
          case GGML_OP_ACC:
-             return true;
+             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
          case GGML_OP_PAD:
 -            // TODO: add circular padding support for syscl, see https://github.com/ggml-org/llama.cpp/pull/16985
              if (ggml_get_op_params_i32(op, 8) != 0) {
@@ -28,7 +32,7 @@ index 2d41a5c..846476e 100644
          case GGML_OP_TIMESTEP_EMBEDDING:
          case GGML_OP_RWKV_WKV6:
 diff --git a/ggml/src/ggml-sycl/pad.cpp b/ggml/src/ggml-sycl/pad.cpp
-index f989c5e..ee93bb5 100644
+index f989c5e4b..ee93bb518 100644
 --- a/ggml/src/ggml-sycl/pad.cpp
 +++ b/ggml/src/ggml-sycl/pad.cpp
 @@ -13,7 +13,8 @@
@@ -132,5 +136,5 @@ index f989c5e..ee93bb5 100644
                   dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], stream);
  }
 -- 
-2.53.0
+2.48.1
 

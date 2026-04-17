@@ -1,16 +1,28 @@
-From b6e177866e89d996d53e67cdb7d0e349074e559a Mon Sep 17 00:00:00 2001
+From e9d13e78a8a61bbcf4db159ff6bae690c966c73d Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 10:58:37 -0700
-Subject: [PATCH 01/10] sycl: remove redundant dpct::has_capability_or_fail
+Subject: [PATCH 02/12] sycl: remove redundant dpct::has_capability_or_fail
  checks
 
 All Intel GPUs from Gen9+ support FP16. These SYCLomatic-generated
 runtime checks add unnecessary overhead per kernel launch (73 call
 sites across 11 files). The capability is verified at compile time
 via the AOT target specification.
+---
+ ggml/src/ggml-sycl/binbcast.cpp     |  6 ---
+ ggml/src/ggml-sycl/convert.cpp      | 84 +----------------------------
+ ggml/src/ggml-sycl/cpy.cpp          | 16 +-----
+ ggml/src/ggml-sycl/dmmv.cpp         | 21 --------
+ ggml/src/ggml-sycl/fattn-common.hpp |  2 -
+ ggml/src/ggml-sycl/getrows.cpp      |  3 --
+ ggml/src/ggml-sycl/ggml-sycl.cpp    |  9 ----
+ ggml/src/ggml-sycl/mmq.cpp          | 60 ---------------------
+ ggml/src/ggml-sycl/quantize.hpp     |  2 -
+ ggml/src/ggml-sycl/set_rows.cpp     |  4 +-
+ 10 files changed, 4 insertions(+), 203 deletions(-)
 
 diff --git a/ggml/src/ggml-sycl/binbcast.cpp b/ggml/src/ggml-sycl/binbcast.cpp
-index 92dd188..6f0d6a0 100644
+index 92dd18889..6f0d6a007 100644
 --- a/ggml/src/ggml-sycl/binbcast.cpp
 +++ b/ggml/src/ggml-sycl/binbcast.cpp
 @@ -220,9 +220,6 @@ struct bin_bcast_sycl {
@@ -34,7 +46,7 @@ index 92dd188..6f0d6a0 100644
                      sycl::nd_range<3>(block_nums * block_dims, block_dims),
                      [=](sycl::nd_item<3> item_ct1) {
 diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
-index f0b072b..2d3bdd8 100644
+index b1484db7b..b10201d7d 100644
 --- a/ggml/src/ggml-sycl/convert.cpp
 +++ b/ggml/src/ggml-sycl/convert.cpp
 @@ -37,10 +37,7 @@ static void dequantize_block_sycl(const void *__restrict__ vx,
@@ -301,7 +313,7 @@ index f0b072b..2d3bdd8 100644
              stream->submit([&](sycl::handler &cgh) {
                    cgh.parallel_for(
                        sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-@@ -602,8 +522,6 @@ template <typename src_t, typename dst_t>
+@@ -614,8 +534,6 @@ template <typename src_t, typename dst_t>
  static void convert_unary_nc_sycl(const void * __restrict__ vx, dst_t * __restrict__ y,
                                    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
                                    const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
@@ -311,7 +323,7 @@ index f0b072b..2d3bdd8 100644
  
      // decrease global range when it exceeds the max int
 diff --git a/ggml/src/ggml-sycl/cpy.cpp b/ggml/src/ggml-sycl/cpy.cpp
-index 9670955..1848e2e 100644
+index 96709554c..1848e2e4d 100644
 --- a/ggml/src/ggml-sycl/cpy.cpp
 +++ b/ggml/src/ggml-sycl/cpy.cpp
 @@ -199,8 +199,6 @@ static void ggml_cpy_f16_f32_sycl(const char * cx, char * cdst, const int ne, co
@@ -373,7 +385,7 @@ index 9670955..1848e2e 100644
              sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
                                sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
 diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
-index 4f27601..9be16eb 100644
+index 5577bf73b..901cbfc1b 100644
 --- a/ggml/src/ggml-sycl/dmmv.cpp
 +++ b/ggml/src/ggml-sycl/dmmv.cpp
 @@ -205,9 +205,6 @@ static void convert_mul_mat_vec_f16_sycl(const void *vx, const dfloat *y,
@@ -386,7 +398,7 @@ index 4f27601..9be16eb 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -874,9 +871,6 @@ static void dequantize_mul_mat_vec_q4_0_sycl_reorder(const void *vx, const dfloa
+@@ -1153,9 +1150,6 @@ static void dequantize_mul_mat_vec_q4_0_sycl_reorder(const void *vx, const dfloa
      const sycl::range<3> block_nums(1, 1, block_num_y);
      const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
      {
@@ -396,7 +408,7 @@ index 4f27601..9be16eb 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -897,9 +891,6 @@ static void dequantize_mul_mat_vec_q4_0_sycl(const void *vx, const dfloat *y,
+@@ -1176,9 +1170,6 @@ static void dequantize_mul_mat_vec_q4_0_sycl(const void *vx, const dfloat *y,
      const sycl::range<3> block_nums(1, 1, block_num_y);
      const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
      {
@@ -406,7 +418,7 @@ index 4f27601..9be16eb 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -918,9 +909,6 @@ static void dequantize_mul_mat_vec_q4_1_sycl(const void *vx, const dfloat *y,
+@@ -1197,9 +1188,6 @@ static void dequantize_mul_mat_vec_q4_1_sycl(const void *vx, const dfloat *y,
      const sycl::range<3> block_nums(1, 1, block_num_y);
      const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
      {
@@ -416,7 +428,7 @@ index 4f27601..9be16eb 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -939,9 +927,6 @@ static void dequantize_mul_mat_vec_q5_0_sycl(const void *vx, const dfloat *y,
+@@ -1218,9 +1206,6 @@ static void dequantize_mul_mat_vec_q5_0_sycl(const void *vx, const dfloat *y,
      const sycl::range<3> block_nums(1, 1, block_num_y);
      const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
      {
@@ -426,7 +438,7 @@ index 4f27601..9be16eb 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -960,9 +945,6 @@ static void dequantize_mul_mat_vec_q5_1_sycl(const void *vx, const dfloat *y,
+@@ -1239,9 +1224,6 @@ static void dequantize_mul_mat_vec_q5_1_sycl(const void *vx, const dfloat *y,
      const sycl::range<3> block_nums(1, 1, block_num_y);
      const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
      {
@@ -436,7 +448,7 @@ index 4f27601..9be16eb 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -981,9 +963,6 @@ static void dequantize_mul_mat_vec_q8_0_sycl(const void *vx, const dfloat *y,
+@@ -1357,9 +1339,6 @@ static void dequantize_mul_mat_vec_q8_0_sycl(const void *vx, const dfloat *y,
      const sycl::range<3> block_nums(1, 1, block_num_y);
      const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
      {
@@ -447,7 +459,7 @@ index 4f27601..9be16eb 100644
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
 diff --git a/ggml/src/ggml-sycl/fattn-common.hpp b/ggml/src/ggml-sycl/fattn-common.hpp
-index ed00d03..9934c21 100644
+index ed00d03c3..9934c2162 100644
 --- a/ggml/src/ggml-sycl/fattn-common.hpp
 +++ b/ggml/src/ggml-sycl/fattn-common.hpp
 @@ -1020,8 +1020,6 @@ void launch_fattn(
@@ -460,7 +472,7 @@ index ed00d03..9934c21 100644
                  sycl::local_accessor<int, 1> buf_iw_acc_ct1(sycl::range<1>(warp_size), cgh);
  
 diff --git a/ggml/src/ggml-sycl/getrows.cpp b/ggml/src/ggml-sycl/getrows.cpp
-index 03f8dd9..c99ebd2 100644
+index 03f8dd907..c99ebd203 100644
 --- a/ggml/src/ggml-sycl/getrows.cpp
 +++ b/ggml/src/ggml-sycl/getrows.cpp
 @@ -153,9 +153,6 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
@@ -474,10 +486,10 @@ index 03f8dd9..c99ebd2 100644
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) {
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index bff2510..2d41a5c 100644
+index 799b13711..d01281a7c 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -1750,9 +1750,6 @@ static void ggml_mul_mat_p021_f16_f32_sycl(const void *vx, const float *y,
+@@ -1774,9 +1774,6 @@ static void ggml_mul_mat_p021_f16_f32_sycl(const void *vx, const float *y,
      const sycl::range<3> block_nums(nchannels_y, nrows_x, 1);
      const sycl::range<3> block_dims(1, 1, WARP_SIZE);
      {
@@ -487,7 +499,7 @@ index bff2510..2d41a5c 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -1770,9 +1767,6 @@ static void ggml_mul_mat_vec_nc_f16_f32_sycl(
+@@ -1794,9 +1791,6 @@ static void ggml_mul_mat_vec_nc_f16_f32_sycl(
      const sycl::range<3> block_nums(nchannels_y, nrows_x, 1);
      const sycl::range<3> block_dims(1, 1, WARP_SIZE);
      {
@@ -497,7 +509,7 @@ index bff2510..2d41a5c 100644
          stream->parallel_for(
              sycl::nd_range<3>(block_nums * block_dims, block_dims),
              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-@@ -3002,9 +2996,6 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
+@@ -3026,9 +3020,6 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
  
      SYCL_CHECK(ggml_sycl_set_device(ctx.device));
      queue_ptr queue = ctx.stream();
@@ -508,7 +520,7 @@ index bff2510..2d41a5c 100644
      float *            dst_ddf  = static_cast<float *>(dst->data);
  
 diff --git a/ggml/src/ggml-sycl/mmq.cpp b/ggml/src/ggml-sycl/mmq.cpp
-index 7996918..cfd0c0e 100644
+index 79969184a..cfd0c0e9a 100644
 --- a/ggml/src/ggml-sycl/mmq.cpp
 +++ b/ggml/src/ggml-sycl/mmq.cpp
 @@ -1820,9 +1820,6 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *vx, const void *vy,
@@ -712,7 +724,7 @@ index 7996918..cfd0c0e 100644
                  sycl::local_accessor<int, 1> tile_x_ql_acc_ct1(
                      sycl::range<1>(mmq_y * (2 * WARP_SIZE) + mmq_y), cgh);
 diff --git a/ggml/src/ggml-sycl/quantize.hpp b/ggml/src/ggml-sycl/quantize.hpp
-index b5c7a54..c6fc75b 100644
+index b5c7a54b7..c6fc75b93 100644
 --- a/ggml/src/ggml-sycl/quantize.hpp
 +++ b/ggml/src/ggml-sycl/quantize.hpp
 @@ -124,8 +124,6 @@ void quantize_row_q8_1_sycl(const float * x, void * vy, const int kx, const int
@@ -724,54 +736,8 @@ index b5c7a54..c6fc75b 100644
      stream->parallel_for(sycl::nd_range<1>({ global_range }, { local_range }),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                               quantize_f<QK8_1 / WARP_SIZE>()(x, vy, kx, kx_padded, it);
-diff --git a/ggml/src/ggml-sycl/rope.cpp b/ggml/src/ggml-sycl/rope.cpp
-index aeaa58b..eb52e72 100644
---- a/ggml/src/ggml-sycl/rope.cpp
-+++ b/ggml/src/ggml-sycl/rope.cpp
-@@ -234,9 +234,6 @@ static void rope_norm_sycl(const T * x, T * dst, const int ne0, const int ne1, c
-     const sycl::range<3> block_nums(1, num_blocks_x, nr);
- 
-     const float theta_scale = powf(freq_base, -2.0f / n_dims);
--
--    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
--
-     if (freq_factors == nullptr) {
-         /*
-         DPCT1049:40: The work-group size passed to the SYCL kernel may exceed
-@@ -271,9 +268,6 @@ static void rope_neox_sycl(const T * x, T * dst, const int ne0, const int ne1, c
-     const sycl::range<3> block_nums(1, num_blocks_x, nr);
- 
-     const float theta_scale = powf(freq_base, -2.0f / n_dims);
--
--    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
--
-     if (freq_factors == nullptr) {
-         stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-             rope_neox<T, false>(x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims,
-@@ -301,9 +295,7 @@ static void rope_multi_sycl(const T * x, T * dst, const int ne0, const int ne1,
- 
-     const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
-     // Add FP16 capability check if T could be sycl::half
--    if constexpr (std::is_same_v<T, sycl::half>) {
--        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
--    }
-+    if constexpr (std::is_same_v<T, sycl::half>) {    }
-     // launch kernel
-     if (freq_factors == nullptr) {
-         stream->parallel_for(nd_range, [=](sycl::nd_item<3> item_ct1) {
-@@ -336,9 +328,7 @@ static void rope_vision_sycl(const T * x, T * dst, const int ne0, const int ne1,
- 
-     const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
-     // Add FP16 capability check if T could be sycl::half
--    if constexpr (std::is_same_v<T, sycl::half>) {
--        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
--    }
-+    if constexpr (std::is_same_v<T, sycl::half>) {    }
-     // launch kernel
-     if (freq_factors == nullptr) {
-         stream->parallel_for(nd_range, [=](sycl::nd_item<3> item_ct1) {
 diff --git a/ggml/src/ggml-sycl/set_rows.cpp b/ggml/src/ggml-sycl/set_rows.cpp
-index a641c10..ec9a91c 100644
+index a641c1009..ec9a91c17 100644
 --- a/ggml/src/ggml-sycl/set_rows.cpp
 +++ b/ggml/src/ggml-sycl/set_rows.cpp
 @@ -168,9 +168,7 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
@@ -786,5 +752,5 @@ index a641c10..ec9a91c 100644
                  ne00, ne01, ne02, ne03,
                  ne11, ne12,
 -- 
-2.53.0
+2.48.1
 

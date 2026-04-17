@@ -1,5 +1,36 @@
+From 6c4a202291d5e59b541601f5ed516998bb632d05 Mon Sep 17 00:00:00 2001
+From: aicss-genai <aicss-genai@users.noreply.github.com>
+Date: Fri, 17 Apr 2026 11:51:24 -0700
+Subject: [PATCH 01/12] sycl: Battlemage AOT + reorder MMVQ/dequant + async
+ mem-op
+
+Kernel and build fixes to make the SYCL backend run correctly on Intel
+Arc Pro B70 (Xe2-HPG, BMG-G31).
+
+- CMakeLists.txt: fix AOT to use spir64_gen target with proper device flag
+- vecdotq.hpp: Q6_K SWAR byte-subtract scalarization for Xe2 SIMD16
+- mmvq.cpp: Q5_K and Q8_0 reorder MMVQ dispatch (256-thread dp4a)
+- quants.hpp: reorder-aware quant type traits for Q5_K/Q8_0
+- ggml-sycl.cpp: supports_reorder dispatch for Q5_K/Q8_0, async mem-op plumbing
+- dequantize.hpp: reorder-aware dequantize kernels for Q5_K/Q8_0
+- convert.cpp: dequantize kernel launchers for reordered layouts
+- mmq.cpp: minor matrix-multiply quant adjustments
+
+Required to build and run correctly on BMG. Delivers a ~50x decode
+improvement over the broken AOT baseline.
+---
+ ggml/src/ggml-sycl/CMakeLists.txt |  20 ++-
+ ggml/src/ggml-sycl/convert.cpp    |  29 ++++-
+ ggml/src/ggml-sycl/dequantize.hpp | 102 ++++++++++++++++
+ ggml/src/ggml-sycl/ggml-sycl.cpp  |  74 +++++++++--
+ ggml/src/ggml-sycl/mmq.cpp        |  45 ++++---
+ ggml/src/ggml-sycl/mmvq.cpp       |  50 +++++++-
+ ggml/src/ggml-sycl/quants.hpp     |  25 ++++
+ ggml/src/ggml-sycl/vecdotq.hpp    | 197 ++++++++++++++++++------------
+ 8 files changed, 432 insertions(+), 110 deletions(-)
+
 diff --git a/ggml/src/ggml-sycl/CMakeLists.txt b/ggml/src/ggml-sycl/CMakeLists.txt
-index 7b07b22..896aee5 100644
+index 8e589fa23..8f44c6ed0 100644
 --- a/ggml/src/ggml-sycl/CMakeLists.txt
 +++ b/ggml/src/ggml-sycl/CMakeLists.txt
 @@ -135,7 +135,11 @@ endif()
@@ -15,7 +46,7 @@ index 7b07b22..896aee5 100644
  
      # Link against Intel oneMKL
      if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-@@ -155,7 +159,15 @@ if (GGML_SYCL_GRAPH)
+@@ -160,7 +164,15 @@ if (GGML_SYCL_HOST_MEM_FALLBACK)
  endif()
  
  if (GGML_SYCL_DEVICE_ARCH)
@@ -35,36 +66,10 @@ index 7b07b22..896aee5 100644
  endif()
 -
 diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
-index d17aca2..f0b072b 100644
+index f3c521b45..b1484db7b 100644
 --- a/ggml/src/ggml-sycl/convert.cpp
 +++ b/ggml/src/ggml-sycl/convert.cpp
-@@ -151,6 +151,25 @@ static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int
- 
- }
- 
-+template <typename dst_t>
-+static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
-+                                     dpct::queue_ptr stream) {
-+
-+    dpct::has_capability_or_fail(stream->get_device(),
-+                                    {sycl::aspect::fp16});
-+
-+    int constexpr WARP_K = WARP_SIZE * QK8_0;
-+    const int n_warp = (k + WARP_K - 1) / WARP_K;
-+    GGML_ASSERT(k % QK8_0 == 0);
-+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_warp) *
-+        sycl::range<3>(1, 1, WARP_SIZE),
-+        sycl::range<3>(1, 1, WARP_SIZE)),
-+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]]{
-+            dequantize_block_q8_0_reorder(vx, y, k, item_ct1);
-+        });
-+
-+}
-+
- template <typename dst_t>
- static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int64_t k,
-                                      dpct::queue_ptr stream) {
-@@ -240,6 +259,23 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
+@@ -259,6 +259,23 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
  #endif
  }
  
@@ -88,21 +93,7 @@ index d17aca2..f0b072b 100644
  template <typename dst_t>
  static void dequantize_row_q6_K_sycl(const void *vx, dst_t *y, const int64_t k,
                                       dpct::queue_ptr stream) {
-@@ -602,7 +638,12 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
-         case GGML_TYPE_Q5_1:
-             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1>;
-         case GGML_TYPE_Q8_0:
--            return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
-+            if (dst->src[0]->extra &&
-+                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
-+                return dequantize_row_q8_0_sycl_reorder;
-+            } else {
-+                return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
-+            }
-         case GGML_TYPE_Q2_K:
-             return dequantize_row_q2_K_sycl;
-         case GGML_TYPE_Q3_K:
-@@ -614,7 +655,11 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
+@@ -650,7 +667,11 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
                  return dequantize_row_q4_K_sycl;
              }
          case GGML_TYPE_Q5_K:
@@ -115,21 +106,7 @@ index d17aca2..f0b072b 100644
          case GGML_TYPE_Q6_K:
              if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                  return dequantize_row_q6_K_sycl_reorder;
-@@ -668,7 +713,12 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
-         case GGML_TYPE_Q5_1:
-             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1>;
-         case GGML_TYPE_Q8_0:
--            return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
-+            if (dst->src[0]->extra &&
-+                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
-+                return dequantize_row_q8_0_sycl_reorder;
-+            } else {
-+                return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
-+            }
-         case GGML_TYPE_Q2_K:
-             return dequantize_row_q2_K_sycl;
-         case GGML_TYPE_Q3_K:
-@@ -681,7 +731,11 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
+@@ -725,7 +746,11 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
                  return dequantize_row_q4_K_sycl;
              }
          case GGML_TYPE_Q5_K:
@@ -143,10 +120,10 @@ index d17aca2..f0b072b 100644
              if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                  return dequantize_row_q6_K_sycl_reorder;
 diff --git a/ggml/src/ggml-sycl/dequantize.hpp b/ggml/src/ggml-sycl/dequantize.hpp
-index da2a605..a834695 100644
+index 19fa88680..96552bd8d 100644
 --- a/ggml/src/ggml-sycl/dequantize.hpp
 +++ b/ggml/src/ggml-sycl/dequantize.hpp
-@@ -162,6 +162,51 @@ static __dpct_inline__ void dequantize_q8_0(const void *vx, const int64_t ib,
+@@ -179,6 +179,51 @@ static __dpct_inline__ void dequantize_q8_0(const void *vx, const int64_t ib,
  #endif // GGML_SYCL_F16
  }
  
@@ -198,7 +175,7 @@ index da2a605..a834695 100644
  template<typename dst_t>
  static void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
                                    const sycl::nd_item<3> &item_ct1) {
-@@ -492,6 +537,63 @@ static void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restri
+@@ -537,6 +582,63 @@ static void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restri
  #endif
  }
  
@@ -263,10 +240,10 @@ index da2a605..a834695 100644
  static void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy,
                                    const sycl::nd_item<3> &item_ct1) {
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index dfacde0..bff2510 100644
+index c02a41ad8..799b13711 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -62,6 +62,7 @@ int g_ggml_sycl_disable_graph = 0;
+@@ -63,6 +63,7 @@ int g_ggml_sycl_disable_graph = 0;
  int g_ggml_sycl_disable_dnn = 0;
  int g_ggml_sycl_prioritize_dmmv = 0;
  int g_ggml_sycl_use_async_mem_op = 0;
@@ -274,7 +251,7 @@ index dfacde0..bff2510 100644
  int g_ggml_sycl_enable_flash_attention = 1;
  
  
-@@ -259,6 +260,8 @@ static void ggml_check_sycl() try {
+@@ -262,6 +263,8 @@ static void ggml_check_sycl() try {
          GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
  #endif
          GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
@@ -283,7 +260,7 @@ index dfacde0..bff2510 100644
  
  #ifdef SYCL_FLASH_ATTN
          GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
-@@ -274,11 +277,11 @@ static void ggml_check_sycl() try {
+@@ -277,11 +280,11 @@ static void ggml_check_sycl() try {
          fprintf(stderr, "%s: SYCL_USE_XMX: no\n", __func__);
  #endif
  */
@@ -299,7 +276,7 @@ index dfacde0..bff2510 100644
          if (g_ggml_sycl_use_async_mem_op) {
              for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count(); ++i) {
                  if (!dpct::dev_mgr::instance().get_device(i).has(sycl::aspect::ext_oneapi_async_memory_alloc)) {
-@@ -2154,6 +2157,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
+@@ -2178,6 +2181,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
  #endif
      if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
          row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
@@ -308,7 +285,7 @@ index dfacde0..bff2510 100644
          ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
          if (src0->type != GGML_TYPE_F16) {
              scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
-@@ -3237,16 +3242,21 @@ enum class mul_mat_algo {
+@@ -3261,9 +3266,12 @@ enum class mul_mat_algo {
  };
  
  inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
@@ -324,36 +301,38 @@ index dfacde0..bff2510 100644
  }
  
  inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
-     switch (type) {
-         case GGML_TYPE_Q4_0:
-+        case GGML_TYPE_Q8_0:
+@@ -3272,6 +3280,7 @@ inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
+         case GGML_TYPE_Q8_0:
              return true;
          case GGML_TYPE_Q4_K:
 +        case GGML_TYPE_Q5_K:
          case GGML_TYPE_Q6_K:
              return !g_ggml_sycl_prioritize_dmmv;
          default:
-@@ -3267,7 +3277,9 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
-     switch (type) {
+@@ -3294,6 +3303,7 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
          case GGML_TYPE_Q4_0:
+         case GGML_TYPE_Q8_0:
          case GGML_TYPE_Q4_K:
 +        case GGML_TYPE_Q5_K:
          case GGML_TYPE_Q6_K:
-+        case GGML_TYPE_Q8_0:
              return true;
          default:
-             return false;
-@@ -3393,6 +3405,49 @@ static void reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
-     sycl_ext_free(stream, tmp_buf);
+@@ -3510,6 +3520,54 @@ static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
+     return true;
  }
  
-+static void reorder_qw_q5_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
++static bool reorder_qw_q5_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
 +    GGML_ASSERT(size % sizeof(block_q5_K) == 0);
 +    GGML_ASSERT(offset % sizeof(block_q5_K) == 0);
 +
 +    const int nblocks = size / sizeof(block_q5_K);
 +
-+    uint8_t * tmp_buf = static_cast<uint8_t *>(sycl_ext_malloc_device(stream, size));
++    sycl_reorder_temp_buffer tmp(stream, size);
++    if (!tmp) {
++        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
++        return false;
++    }
++    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
 +
 +    sycl::event copy_event;
 +    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
@@ -387,69 +366,23 @@ index dfacde0..bff2510 100644
 +    if (!g_ggml_sycl_use_async_mem_op) {
 +        reorder_event.wait_and_throw();
 +    }
-+    sycl_ext_free(stream, tmp_buf);
++    return true;
 +}
 +
- static void reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
+ static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
      GGML_ASSERT(size % sizeof(block_q6_K) == 0);
      GGML_ASSERT(offset % sizeof(block_q6_K) == 0);
-@@ -3441,6 +3496,38 @@ static void reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, d
-     sycl_ext_free(stream, tmp_buf);
- }
- 
-+static void reorder_qw_q8_0(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
-+    GGML_ASSERT(size % sizeof(block_q8_0) == 0);
-+    GGML_ASSERT(offset % sizeof(block_q8_0) == 0);
-+
-+    const int nblocks = size / sizeof(block_q8_0);
-+
-+    uint8_t * tmp_buf = static_cast<uint8_t *>(sycl_ext_malloc_device(stream, size));
-+
-+    sycl::event copy_event;
-+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
-+    if (!g_ggml_sycl_use_async_mem_op) {
-+        copy_event.wait();
-+    }
-+
-+    auto * qs_ptr = data_device;
-+    auto * d_ptr  = reinterpret_cast<ggml_half *>(qs_ptr + QK8_0 * nblocks);
-+
-+    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
-+        const block_q8_0 * x = (const block_q8_0*) tmp_buf;
-+        const int ib = i;
-+        for (int j = 0; j < QK8_0; ++j) {
-+            qs_ptr[ib * QK8_0 + j] = reinterpret_cast<const uint8_t *>(x[ib].qs)[j];
-+        }
-+        d_ptr[ib] = x[ib].d;
-+    });
-+
-+    if (!g_ggml_sycl_use_async_mem_op) {
-+        reorder_event.wait_and_throw();
-+    }
-+    sycl_ext_free(stream, tmp_buf);
-+}
-+
- static void reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
-     uint8_t * data_device = (uint8_t *) src0->data;
-     size_t ncols = src0->ne[0];
-@@ -3454,9 +3541,15 @@ static void reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+@@ -3576,6 +3634,8 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+             return reorder_qw_q8_0(data_device, ncols, nrows, size, 0, stream);
          case GGML_TYPE_Q4_K:
-             reorder_qw_q4_k(data_device, size, 0, stream);
-             break;
+             return reorder_qw_q4_k(data_device, size, 0, stream);
 +        case GGML_TYPE_Q5_K:
-+            reorder_qw_q5_k(data_device, size, 0, stream);
-+            break;
++            return reorder_qw_q5_k(data_device, size, 0, stream);
          case GGML_TYPE_Q6_K:
-             reorder_qw_q6_k(data_device, size, 0, stream);
-             break;
-+        case GGML_TYPE_Q8_0:
-+            reorder_qw_q8_0(data_device, size, 0, stream);
-+            break;
+             return reorder_qw_q6_k(data_device, size, 0, stream);
          default:
-             GGML_ABORT("reorder_qw() called with unsupported type");
-             break;
 diff --git a/ggml/src/ggml-sycl/mmq.cpp b/ggml/src/ggml-sycl/mmq.cpp
-index ffb272a..7996918 100644
+index ffb272aa2..79969184a 100644
 --- a/ggml/src/ggml-sycl/mmq.cpp
 +++ b/ggml/src/ggml-sycl/mmq.cpp
 @@ -13,6 +13,11 @@
@@ -645,10 +578,10 @@ index ffb272a..7996918 100644
                              vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
                              nrows_dst, item_ct1,
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index 316aa0d..5739cdb 100644
+index af22b98dd..75d9f040a 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -686,6 +686,26 @@ static void mul_mat_vec_q8_0_q8_1_sycl(const void *vx, const void *vy,
+@@ -722,6 +722,26 @@ static void mul_mat_vec_q8_0_q8_1_sycl(const void *vx, const void *vy,
      }
  }
  
@@ -675,7 +608,7 @@ index 316aa0d..5739cdb 100644
  static void mul_mat_vec_q2_K_q8_1_sycl(const void *vx, const void *vy,
                                         float *dst, const int ncols,
                                         const int nrows,
-@@ -803,6 +823,26 @@ static void mul_mat_vec_q5_K_q8_1_sycl(const void *vx, const void *vy,
+@@ -839,6 +859,26 @@ static void mul_mat_vec_q5_K_q8_1_sycl(const void *vx, const void *vy,
      }
  }
  
@@ -702,23 +635,15 @@ index 316aa0d..5739cdb 100644
  static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
                                                 const int nrows, dpct::queue_ptr stream) {
      GGML_ASSERT(ncols % QK_K == 0);
-@@ -1084,7 +1124,14 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
-                 mul_mat_vec_q5_1_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                 break;
-             case GGML_TYPE_Q8_0:
--                mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-+                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
-+                    GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl\n");
-+                    reorder_mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-+                } else {
+@@ -1125,6 +1165,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                     GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl\n");
+                     reorder_mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 } else {
 +                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q8_0_q8_1_sycl\n");
-+                    mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-+                }
+                     mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 }
                  break;
-             case GGML_TYPE_Q2_K:
-                 mul_mat_vec_q2_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-@@ -1103,7 +1150,14 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+@@ -1145,7 +1186,14 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                  }
                  break;
              case GGML_TYPE_Q5_K:
@@ -735,10 +660,10 @@ index 316aa0d..5739cdb 100644
              case GGML_TYPE_Q6_K:
                  if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
 diff --git a/ggml/src/ggml-sycl/quants.hpp b/ggml/src/ggml-sycl/quants.hpp
-index 14490fe..2e9cd1d 100644
+index 1f5b62740..806028ef3 100644
 --- a/ggml/src/ggml-sycl/quants.hpp
 +++ b/ggml/src/ggml-sycl/quants.hpp
-@@ -79,6 +79,52 @@ template <> struct block_q_t<GGML_TYPE_Q4_K> {
+@@ -79,6 +79,31 @@ template <> struct block_q_t<GGML_TYPE_Q4_K> {
      static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
  };
  
@@ -767,35 +692,14 @@ index 14490fe..2e9cd1d 100644
 +    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 +};
 +
-+template <> struct block_q_t<GGML_TYPE_Q8_0> {
-+    struct traits {
-+        static constexpr uint32_t qk       = QK8_0;
-+        static constexpr uint32_t qi       = QI8_0;
-+        static constexpr uint32_t qr       = QR8_0;
-+        static constexpr uint32_t vdr_mmvq = 2;
-+    };
-+
-+    // Reordered layout: [qs (QK8_0 bytes per block)] [d (sizeof(ggml_half) per block)]
-+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* n_blocks */) {
-+        return { block_index * QK8_0, 0 };
-+    }
-+
-+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
-+        auto nblocks = nrows * (ncols / QK8_0);
-+        return { nblocks * QK8_0 + block_index * static_cast<int>(sizeof(ggml_half)), 0 };
-+    }
-+
-+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
-+};
-+
  template <> struct block_q_t<GGML_TYPE_Q6_K> {
      struct traits {
          static constexpr uint32_t qk       = QK_K;
 diff --git a/ggml/src/ggml-sycl/vecdotq.hpp b/ggml/src/ggml-sycl/vecdotq.hpp
-index 9a267d8..dc7a7e9 100644
+index 9253168e5..16b2d65d2 100644
 --- a/ggml/src/ggml-sycl/vecdotq.hpp
 +++ b/ggml/src/ggml-sycl/vecdotq.hpp
-@@ -72,6 +72,32 @@ static __dpct_inline__ int get_int_from_uint8_aligned(
+@@ -85,6 +85,32 @@ static __dpct_inline__ int get_int_from_uint8_aligned(
        (const int*)(x8 + sizeof(int) * i32)); // assume at least 4 byte alignment
  }
  
@@ -828,7 +732,7 @@ index 9a267d8..dc7a7e9 100644
  static __dpct_inline__ void get_int_from_table_16(const uint32_t &q4,
                                                    const uint8_t *values,
                                                    int &val1, int &val2) {
-@@ -266,24 +292,8 @@ vec_dot_q6_K_q8_1_impl_mmvq(const int &vl, const int &vh,
+@@ -279,24 +305,8 @@ vec_dot_q6_K_q8_1_impl_mmvq(const int &vl, const int &vh,
                              const int *__restrict__ u,
                              const int8_t *__restrict__ scales, const float &d,
                              const float *__restrict__ d8) {
@@ -855,32 +759,49 @@ index 9a267d8..dc7a7e9 100644
  }
  
  // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
-@@ -338,6 +348,39 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0> {
-     };
- };
+@@ -357,38 +367,31 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
+     using q8_0_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>;
+     using q8_0_traits = typename q8_0_block::traits;
  
-+template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
-+    static constexpr ggml_type gtype = GGML_TYPE_Q8_0;
-+
-+    using q8_0_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>;
-+    using q8_0_traits = typename q8_0_block::traits;
-+
-+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
-+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
-+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+-    __dpct_inline__ float vec_dot_q8_0_q8_1_impl(const int * v, const int * u, const float & d8_0, const sycl::half2 & ds8) {
+-        int sumi = 0;
+-
+-#pragma unroll
+-        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
+-            // Q8_0 values are signed int8, no nibble extraction needed
+-            // Direct dp4a: each int packs 4 int8 values
+-            sumi = dpct::dp4a(v[i], u[i], sumi);
+-        }
+-
+-        const sycl::float2 ds8f = ds8.convert<float, sycl::rounding_mode::automatic>();
+-
+-        // Q8_0 has no bias term (values are signed), so just scale
+-        return d8_0 * sumi * ds8f.x();
+-    }
+-
+     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                      const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                      const sycl::half2 * q8_1_ds, const int & iqs) {
+-        const int8_t * bq8_0 = static_cast<const int8_t *>(vbq) + ibx_offset.first;
+-        const ggml_half d = *(reinterpret_cast<const ggml_half *>(static_cast<const uint8_t *>(vbq) + d_offset.first));
+-        int             v[q8_0_traits::vdr_mmvq];
+-        int             u[q8_0_traits::vdr_mmvq];
 +        const uint8_t * base = static_cast<const uint8_t *>(vbq);
 +        const int8_t *  qs   = reinterpret_cast<const int8_t *>(base + ibx_offset.first);
 +        const ggml_half  d   = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
 +
 +        int v[q8_0_traits::vdr_mmvq];
 +        int u[q8_0_traits::vdr_mmvq];
-+
-+#pragma unroll
-+        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
+ 
+ #pragma unroll
+         for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
+-            v[i] = get_int_from_int8(bq8_0, iqs + i);
 +            v[i] = get_int_from_int8(qs, iqs + i);
-+            u[i] = get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i);
-+        }
-+
+             u[i] = get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i);
+         }
+ 
+-        return vec_dot_q8_0_q8_1_impl(v, u, d, *q8_1_ds);
+-    };
 +        int sumi = 0;
 +#pragma unroll
 +        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
@@ -890,12 +811,10 @@ index 9a267d8..dc7a7e9 100644
 +        const sycl::half2 ds_values = *q8_1_ds;
 +        return static_cast<float>(d) * static_cast<float>(ds_values[0]) * sumi;
 +    }
-+};
-+
+ };
+ 
  static inline float vec_dot_q4_K_q8_1_common(const int * __restrict__ q4, const uint16_t * __restrict__ scales,
-                                              const ggml_half2 & dm, const block_q8_1 * __restrict__ bq8_1,
-                                              const int &        iqs) {
-@@ -428,32 +471,76 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K> {
+@@ -481,32 +484,76 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K> {
      }
  };
  
@@ -940,7 +859,8 @@ index 9a267d8..dc7a7e9 100644
 +
 +        vh[0] = qh_ptr[0] >> bq8_offset;
 +        vh[1] = qh_ptr[4] >> bq8_offset;
-+
+ 
+-            const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
 +        uint16_t  aux[2];
 +        const int j = (QR5_K * ((iqs / 2) / (QI8_1 / 2))) / 2;
 +        if (j < 2) {
@@ -950,8 +870,7 @@ index 9a267d8..dc7a7e9 100644
 +            aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
 +            aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
 +        }
- 
--            const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
++
 +        const uint8_t * sc = (const uint8_t *) aux;
 +        const uint8_t * m  = sc + 2;
  
@@ -989,7 +908,7 @@ index 9a267d8..dc7a7e9 100644
      }
  
      __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
-@@ -474,16 +561,15 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
+@@ -527,16 +574,15 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
  
          const int8_t * scs = scales + scale_offset;
  
@@ -1014,7 +933,7 @@ index 9a267d8..dc7a7e9 100644
      }
  };
  #define VDR_Q4_0_Q8_1_MMVQ 2
-@@ -1033,16 +1119,15 @@ vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
+@@ -1115,16 +1161,15 @@ vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
  
      const int8_t * scales = bq6_K->scales + scale_offset;
  
@@ -1039,3 +958,6 @@ index 9a267d8..dc7a7e9 100644
  }
  
  
+-- 
+2.48.1
+

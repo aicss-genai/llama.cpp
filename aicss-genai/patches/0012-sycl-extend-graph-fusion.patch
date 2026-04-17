@@ -1,7 +1,7 @@
-From 3fa285bfd6d8268e4cc91bfd2077a17e687413b8 Mon Sep 17 00:00:00 2001
+From a6b588659b9271c437360e71ff97a0d645d4746c Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 12:39:50 -0700
-Subject: [PATCH] sycl: extend graph fusion (RMS_NORM+MUL+ADD, UNARY+MUL)
+Subject: [PATCH 12/12] sycl: extend graph fusion (RMS_NORM+MUL+ADD, UNARY+MUL)
 
 Add 3-op RMS_NORM+MUL+ADD fusion for residual+norm+weight pattern.
 Saves two kernel launches per layer vs the 2-op fusion.
@@ -10,12 +10,17 @@ Add UNARY(SiLU/sigmoid/softplus)+MUL fusion for activation gates.
 Only fuses when operands have same shape (no broadcast).
 
 Both match CUDA backend fusion patterns.
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp |  7 +++
+ ggml/src/ggml-sycl/norm.cpp      | 96 +++++++++++++++++++++++++++++---
+ ggml/src/ggml-sycl/norm.hpp      |  2 +
+ 3 files changed, 98 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index a8a6c10..ed3ea59 100644
+index c7c632db9..b331a13b7 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -4498,6 +4498,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -4567,6 +4567,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  
@@ -30,7 +35,7 @@ index a8a6c10..ed3ea59 100644
              ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
              ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
 diff --git a/ggml/src/ggml-sycl/norm.cpp b/ggml/src/ggml-sycl/norm.cpp
-index b1f799f..daa34a9 100644
+index bde41fffb..880029d74 100644
 --- a/ggml/src/ggml-sycl/norm.cpp
 +++ b/ggml/src/ggml-sycl/norm.cpp
 @@ -202,11 +202,13 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols, const int6
@@ -66,7 +71,7 @@ index b1f799f..daa34a9 100644
      }
  }
  
-@@ -425,10 +434,11 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
+@@ -412,10 +421,11 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
      }
  }
  
@@ -79,7 +84,7 @@ index b1f799f..daa34a9 100644
          const float eps, queue_ptr stream, int device) {
  
      const sycl::range<3> global_dims(nsamples, nchannels, nrows);
-@@ -438,8 +448,9 @@ static void rms_norm_mul_f32_sycl(const float * x, const float * mul, float * ds
+@@ -425,8 +435,9 @@ static void rms_norm_mul_f32_sycl(const float * x, const float * mul, float * ds
              cgh.parallel_for(
                  sycl::nd_range<3>(global_dims * block_dims, block_dims),
                  [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -90,7 +95,7 @@ index b1f799f..daa34a9 100644
                                       eps, item_ct1, nullptr, WARP_SIZE);
                  });
          });
-@@ -452,8 +463,9 @@ static void rms_norm_mul_f32_sycl(const float * x, const float * mul, float * ds
+@@ -439,8 +450,9 @@ static void rms_norm_mul_f32_sycl(const float * x, const float * mul, float * ds
              cgh.parallel_for(
                  sycl::nd_range<3>(global_dims * block_dims, block_dims),
                  [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -101,7 +106,7 @@ index b1f799f..daa34a9 100644
                                       eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size);
                  });
          });
-@@ -614,10 +626,80 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
+@@ -609,10 +621,80 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
      const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
      const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
  
@@ -184,7 +189,7 @@ index b1f799f..daa34a9 100644
  }
  
 diff --git a/ggml/src/ggml-sycl/norm.hpp b/ggml/src/ggml-sycl/norm.hpp
-index 773ab1f..7bd59c3 100644
+index 773ab1f51..7bd59c330 100644
 --- a/ggml/src/ggml-sycl/norm.hpp
 +++ b/ggml/src/ggml-sycl/norm.hpp
 @@ -21,6 +21,8 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
@@ -197,5 +202,5 @@ index 773ab1f..7bd59c3 100644
  
  void ggml_sycl_op_group_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
 -- 
-2.53.0
+2.48.1
 

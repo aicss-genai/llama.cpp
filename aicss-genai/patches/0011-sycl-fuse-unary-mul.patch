@@ -1,7 +1,7 @@
-From ea58ed45e0c82b1f2d0e179d538577b7b465b54e Mon Sep 17 00:00:00 2001
+From f0b9b299bfda12ad585653a4ce0e0ca081a72f5b Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 12:23:35 -0700
-Subject: [PATCH] sycl: fuse UNARY(SiLU/sigmoid/softplus)+MUL via graph
+Subject: [PATCH 11/12] sycl: fuse UNARY(SiLU/sigmoid/softplus)+MUL via graph
  detection
 
 Combine activation function with element-wise gate multiply into a
@@ -9,12 +9,15 @@ single kernel launch. Only fuses when both operands have the same
 shape (no broadcast). Saves one kernel launch per fused pair.
 
 Matches CUDA's ggml_cuda_op_unary_mul pattern.
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 53 ++++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 67ac85f..a8a6c10 100644
+index 10ac3bc8f..c7c632db9 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -2871,6 +2871,45 @@ static void ggml_sycl_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * ds
+@@ -2894,6 +2894,45 @@ static void ggml_sycl_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * ds
      ggml_sycl_op_rms_norm(ctx, dst);
  }
  
@@ -60,7 +63,7 @@ index 67ac85f..a8a6c10 100644
  static void ggml_sycl_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
      ggml_sycl_op_rms_norm_back(ctx, dst);
-@@ -4466,6 +4505,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -4535,6 +4574,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  
@@ -82,5 +85,5 @@ index 67ac85f..a8a6c10 100644
          assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
          for (int j = 0; j < GGML_MAX_SRC; j++) {
 -- 
-2.53.0
+2.48.1
 

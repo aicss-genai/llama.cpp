@@ -1,7 +1,8 @@
-From de883611a06259f38319e1ae033a6296b8d524a5 Mon Sep 17 00:00:00 2001
+From 8291debfa8dfdaa9a66d7a609d4dc1cffc51ce3c Mon Sep 17 00:00:00 2001
 From: unrahul <unrahul@users.noreply.archlinux.org>
 Date: Thu, 9 Apr 2026 11:42:38 -0700
-Subject: [PATCH] sycl: replace dpct::permute_sub_group_by_xor with native SYCL
+Subject: [PATCH 08/12] sycl: replace dpct::permute_sub_group_by_xor with
+ native SYCL
 
 Replace all dpct shuffle wrappers with sycl::select_from_group across
 common.hpp (11 warp_reduce variants), mmvq.cpp (10), dmmv.cpp (7),
@@ -12,12 +13,20 @@ but included here for files that changed).
 
 This removes the last dpct dependency from the hot compute path.
 The dpct helper library is still linked for other utilities.
+---
+ ggml/src/ggml-sycl/common.hpp       | 121 +++++++++++-----------------
+ ggml/src/ggml-sycl/dmmv.cpp         |  14 ++--
+ ggml/src/ggml-sycl/fattn-common.hpp |   5 +-
+ ggml/src/ggml-sycl/fattn-vec.hpp    |  13 ++-
+ ggml/src/ggml-sycl/ggml-sycl.cpp    |  14 ++--
+ ggml/src/ggml-sycl/mmvq.cpp         |  20 ++---
+ 6 files changed, 81 insertions(+), 106 deletions(-)
 
 diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
-index 298fddc..2268ad4 100644
+index fd84c9178..64a36c0dd 100644
 --- a/ggml/src/ggml-sycl/common.hpp
 +++ b/ggml/src/ggml-sycl/common.hpp
-@@ -430,80 +430,71 @@ struct ggml_backend_sycl_context {
+@@ -431,80 +431,71 @@ struct ggml_backend_sycl_context {
  // common device functions
  
  static __dpct_inline__ float warp_reduce_sum(float x,
@@ -129,7 +138,7 @@ index 298fddc..2268ad4 100644
  }
  
  static constexpr int ggml_sycl_get_physical_warp_size() {
-@@ -511,68 +502,50 @@ static constexpr int ggml_sycl_get_physical_warp_size() {
+@@ -512,68 +503,50 @@ static constexpr int ggml_sycl_get_physical_warp_size() {
    return WARP_SIZE;
  }
  
@@ -215,7 +224,7 @@ index 298fddc..2268ad4 100644
      return x;
  }
 diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
-index 9be16eb..d8ca188 100644
+index 901cbfc1b..953e7c967 100644
 --- a/ggml/src/ggml-sycl/dmmv.cpp
 +++ b/ggml/src/ggml-sycl/dmmv.cpp
 @@ -78,7 +78,7 @@ static void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat *
@@ -263,7 +272,7 @@ index 9be16eb..d8ca188 100644
      }
  
      if (tid == 0) {
-@@ -738,7 +738,7 @@ static void dequantize_mul_mat_vec_q5_k(const void *__restrict__ vx,
+@@ -894,7 +894,7 @@ static void dequantize_mul_mat_vec_q5_k(const void *__restrict__ vx,
  #pragma unroll
      for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -272,7 +281,7 @@ index 9be16eb..d8ca188 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -853,7 +853,7 @@ static void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx, const floa
+@@ -1009,7 +1009,7 @@ static void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx, const floa
  #pragma unroll
      for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -282,7 +291,7 @@ index 9be16eb..d8ca188 100644
  
      if (tid == 0) {
 diff --git a/ggml/src/ggml-sycl/fattn-common.hpp b/ggml/src/ggml-sycl/fattn-common.hpp
-index 9934c21..8ffdf84 100644
+index 9934c2162..8ffdf8401 100644
 --- a/ggml/src/ggml-sycl/fattn-common.hpp
 +++ b/ggml/src/ggml-sycl/fattn-common.hpp
 @@ -316,8 +316,8 @@ static __dpct_inline__ void quantize_q8_1_to_shared(const float * __restrict__ x
@@ -305,7 +314,7 @@ index 9934c21..8ffdf84 100644
                  sycl::local_accessor<int, 1> buf_iw_acc_ct1(sycl::range<1>(warp_size), cgh);
  
 diff --git a/ggml/src/ggml-sycl/fattn-vec.hpp b/ggml/src/ggml-sycl/fattn-vec.hpp
-index 48c3890..df1eb44 100644
+index 8031acfdf..59f455a27 100644
 --- a/ggml/src/ggml-sycl/fattn-vec.hpp
 +++ b/ggml/src/ggml-sycl/fattn-vec.hpp
 @@ -340,13 +340,12 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
@@ -329,10 +338,10 @@ index 48c3890..df1eb44 100644
              const float KQ_max_scale = sycl::native::exp((float) (KQ_max[j] - KQ_max_new[j]));
              KQ_max[j] = KQ_max_new[j];
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 90a0ee1..7c174da 100644
+index ee0a6e39b..e41d42bf2 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -1501,7 +1501,7 @@ static void mul_mat_p021_f16_f32(
+@@ -1524,7 +1524,7 @@ static void mul_mat_p021_f16_f32(
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -341,7 +350,7 @@ index 90a0ee1..7c174da 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -1553,7 +1553,7 @@ static void mul_mat_vec_nc_f16_f32( // nc == non-contiguous
+@@ -1576,7 +1576,7 @@ static void mul_mat_vec_nc_f16_f32( // nc == non-contiguous
  #pragma unroll
      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
          tmp +=
@@ -350,7 +359,7 @@ index 90a0ee1..7c174da 100644
      }
  
      if (item_ct1.get_local_id(2) == 0) {
-@@ -3002,6 +3002,8 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
+@@ -3025,6 +3025,8 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
  
      SYCL_CHECK(ggml_sycl_set_device(ctx.device));
      queue_ptr queue = ctx.stream();
@@ -359,7 +368,7 @@ index 90a0ee1..7c174da 100644
      const sycl::half * src0_f16 = static_cast<const sycl::half *>(src0->data);
      float *            dst_ddf  = static_cast<float *>(dst->data);
  
-@@ -5005,10 +5007,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5093,10 +5095,6 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
              return op->type == GGML_TYPE_F32 &&
                     op->src[0]->type == GGML_TYPE_F32 &&
                     op->src[1]->type == GGML_TYPE_F32;
@@ -370,7 +379,7 @@ index 90a0ee1..7c174da 100644
          case GGML_OP_SSM_SCAN: {
              if (op->src[3]->ne[0] == 1) {
                  return (op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256) && op->src[0]->ne[1] % WARP_SIZE == 0;
-@@ -5023,6 +5021,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5110,6 +5108,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
              return true;
          case GGML_OP_SOLVE_TRI:
              return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
@@ -382,7 +391,7 @@ index 90a0ee1..7c174da 100644
              return ggml_sycl_flash_attn_ext_supported(device, op);
          default:
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index 5739cdb..239099c 100644
+index 75d9f040a..45f92e7c4 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
 @@ -92,7 +92,7 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
@@ -476,5 +485,5 @@ index 5739cdb..239099c 100644
  
      if (item_ct1.get_local_id(2) == 0) {
 -- 
-2.53.0
+2.48.1
 
