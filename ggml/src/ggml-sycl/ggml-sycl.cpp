@@ -3560,6 +3560,54 @@ static bool reorder_qw_q5_k(uint8_t * data_device, size_t size, size_t offset, d
     sycl_ext_free(stream, tmp_buf);
 }
 
+static bool reorder_qw_q5_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
+    GGML_ASSERT(size % sizeof(block_q5_K) == 0);
+    GGML_ASSERT(offset % sizeof(block_q5_K) == 0);
+
+    const int nblocks = size / sizeof(block_q5_K);
+
+    sycl_reorder_temp_buffer tmp(stream, size);
+    if (!tmp) {
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
+        return false;
+    }
+    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
+
+    sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
+    if (!g_ggml_sycl_use_async_mem_op) {
+        copy_event.wait();
+    }
+
+    auto * qs_ptr     = data_device;
+    auto * qh_ptr     = qs_ptr + (QK_K / 2) * nblocks;
+    auto * scales_ptr = qh_ptr + (QK_K / 8) * nblocks;
+    auto * dm_ptr     = (sycl::half2 *) (scales_ptr + K_SCALE_SIZE * nblocks);
+
+    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
+        const block_q5_K * x  = (const block_q5_K *) tmp_buf;
+        const int          ib = i;
+
+        for (int j = 0; j < QK_K / 2; ++j) {
+            qs_ptr[ib * (QK_K / 2) + j] = x[ib].qs[j];
+        }
+
+        for (int j = 0; j < QK_K / 8; ++j) {
+            qh_ptr[ib * (QK_K / 8) + j] = x[ib].qh[j];
+        }
+
+        for (int j = 0; j < K_SCALE_SIZE; ++j) {
+            scales_ptr[ib * K_SCALE_SIZE + j] = x[ib].scales[j];
+        }
+
+        dm_ptr[ib] = x[ib].dm;
+    });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        reorder_event.wait_and_throw();
+    }
+    return true;
+}
+
 static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
     GGML_ASSERT(size % sizeof(block_q6_K) == 0);
     GGML_ASSERT(offset % sizeof(block_q6_K) == 0);

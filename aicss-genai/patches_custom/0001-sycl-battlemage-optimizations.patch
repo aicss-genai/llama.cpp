@@ -1,0 +1,963 @@
+From 6c4a202291d5e59b541601f5ed516998bb632d05 Mon Sep 17 00:00:00 2001
+From: aicss-genai <aicss-genai@users.noreply.github.com>
+Date: Fri, 17 Apr 2026 11:51:24 -0700
+Subject: [PATCH 01/12] sycl: Battlemage AOT + reorder MMVQ/dequant + async
+ mem-op
+
+Kernel and build fixes to make the SYCL backend run correctly on Intel
+Arc Pro B70 (Xe2-HPG, BMG-G31).
+
+- CMakeLists.txt: fix AOT to use spir64_gen target with proper device flag
+- vecdotq.hpp: Q6_K SWAR byte-subtract scalarization for Xe2 SIMD16
+- mmvq.cpp: Q5_K and Q8_0 reorder MMVQ dispatch (256-thread dp4a)
+- quants.hpp: reorder-aware quant type traits for Q5_K/Q8_0
+- ggml-sycl.cpp: supports_reorder dispatch for Q5_K/Q8_0, async mem-op plumbing
+- dequantize.hpp: reorder-aware dequantize kernels for Q5_K/Q8_0
+- convert.cpp: dequantize kernel launchers for reordered layouts
+- mmq.cpp: minor matrix-multiply quant adjustments
+
+Required to build and run correctly on BMG. Delivers a ~50x decode
+improvement over the broken AOT baseline.
+---
+ ggml/src/ggml-sycl/CMakeLists.txt |  20 ++-
+ ggml/src/ggml-sycl/convert.cpp    |  29 ++++-
+ ggml/src/ggml-sycl/dequantize.hpp | 102 ++++++++++++++++
+ ggml/src/ggml-sycl/ggml-sycl.cpp  |  74 +++++++++--
+ ggml/src/ggml-sycl/mmq.cpp        |  45 ++++---
+ ggml/src/ggml-sycl/mmvq.cpp       |  50 +++++++-
+ ggml/src/ggml-sycl/quants.hpp     |  25 ++++
+ ggml/src/ggml-sycl/vecdotq.hpp    | 197 ++++++++++++++++++------------
+ 8 files changed, 432 insertions(+), 110 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/CMakeLists.txt b/ggml/src/ggml-sycl/CMakeLists.txt
+index 8e589fa23..8f44c6ed0 100644
+--- a/ggml/src/ggml-sycl/CMakeLists.txt
++++ b/ggml/src/ggml-sycl/CMakeLists.txt
+@@ -135,7 +135,11 @@ endif()
+ 
+ if (GGML_SYCL_TARGET STREQUAL "INTEL")
+     add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
+-    target_link_options(ggml-sycl PRIVATE  -Xs   -ze-intel-greater-than-4GB-buffer-required)
++    if (NOT GGML_SYCL_DEVICE_ARCH)
++        target_link_options(ggml-sycl PRIVATE -Xs -ze-intel-greater-than-4GB-buffer-required)
++    else()
++        message(STATUS "Skipping -ze-intel-greater-than-4GB-buffer-required for spir64_gen AOT")
++    endif()
+ 
+     # Link against Intel oneMKL
+     if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+@@ -160,7 +164,15 @@ if (GGML_SYCL_HOST_MEM_FALLBACK)
+ endif()
+ 
+ if (GGML_SYCL_DEVICE_ARCH)
+-    target_compile_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
+-    target_link_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
++    message(STATUS "GGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} (AOT via spir64_gen)")
++    target_compile_options(
++        ggml-sycl PRIVATE
++        -fsycl-targets=spir64_gen
++        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
++    )
++    target_link_options(
++        ggml-sycl PRIVATE
++        -fsycl-targets=spir64_gen
++        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
++    )
+ endif()
+-
+diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
+index f3c521b45..b1484db7b 100644
+--- a/ggml/src/ggml-sycl/convert.cpp
++++ b/ggml/src/ggml-sycl/convert.cpp
+@@ -259,6 +259,23 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
+ #endif
+ }
+ 
++template <typename dst_t>
++static void dequantize_row_q5_K_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
++    const int64_t nb = k / QK_K;
++
++    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
++
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(K_SCALE_SIZE), cgh);
++
++        cgh.parallel_for(
++            sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
++            [=](sycl::nd_item<3> item_ct1) {
++                dequantize_block_q5_K_reorder(vx, y, get_pointer(scale_local_acc), item_ct1, nb);
++            });
++    });
++}
++
+ template <typename dst_t>
+ static void dequantize_row_q6_K_sycl(const void *vx, dst_t *y, const int64_t k,
+                                      dpct::queue_ptr stream) {
+@@ -650,7 +667,11 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
+                 return dequantize_row_q4_K_sycl;
+             }
+         case GGML_TYPE_Q5_K:
+-            return dequantize_row_q5_K_sycl;
++            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
++                return dequantize_row_q5_K_sycl_reorder;
++            } else {
++                return dequantize_row_q5_K_sycl;
++            }
+         case GGML_TYPE_Q6_K:
+             if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                 return dequantize_row_q6_K_sycl_reorder;
+@@ -725,7 +746,11 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
+                 return dequantize_row_q4_K_sycl;
+             }
+         case GGML_TYPE_Q5_K:
+-            return dequantize_row_q5_K_sycl;
++            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
++                return dequantize_row_q5_K_sycl_reorder;
++            } else {
++                return dequantize_row_q5_K_sycl;
++            }
+         case GGML_TYPE_Q6_K:
+             if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                 return dequantize_row_q6_K_sycl_reorder;
+diff --git a/ggml/src/ggml-sycl/dequantize.hpp b/ggml/src/ggml-sycl/dequantize.hpp
+index 19fa88680..96552bd8d 100644
+--- a/ggml/src/ggml-sycl/dequantize.hpp
++++ b/ggml/src/ggml-sycl/dequantize.hpp
+@@ -179,6 +179,51 @@ static __dpct_inline__ void dequantize_q8_0(const void *vx, const int64_t ib,
+ #endif // GGML_SYCL_F16
+ }
+ 
++static __dpct_inline__ void dequantize_q8_0_reorder(const void *d_ptr, const int64_t ib, const void *qs,
++                                            const int iqs, dfloat2 &v) {
++    const dfloat d = (const dfloat)*((const sycl::half*)d_ptr+ib);
++
++    const int8_t * qs_ptr = (const int8_t *)qs;
++
++    v.x() = qs_ptr[iqs + 0];
++    v.y() = qs_ptr[iqs + 1];
++
++#ifdef GGML_SYCL_F16
++    v.s0() *= d;
++    v.s1() *= d;
++#else
++    v.x() *= d;
++    v.y() *= d;
++#endif // GGML_SYCL_F16
++}
++
++template<typename dst_t>
++static void dequantize_block_q8_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
++                                  const sycl::nd_item<3> &item_ct1) {
++
++    const int64_t i = item_ct1.get_group(2);
++
++    // assume 32 threads
++    const int64_t tid = item_ct1.get_local_id(2);
++    const int64_t lane_ib = i * WARP_SIZE + tid;
++
++    if (lane_ib >= k / QK8_0) {
++        return;
++    }
++
++    dst_t * y_ptr = yy + lane_ib * QK8_0;
++
++    auto qs = (const int8_t*)vx + lane_ib * QK8_0;
++    auto s_ptr = (const sycl::half*)((const uint8_t*)vx + k) + lane_ib;
++
++    const float d = float(*s_ptr);
++
++#pragma unroll
++    for (int l = 0; l < QK8_0; ++l) {
++        y_ptr[l] = d * qs[l];
++    }
++}
++
+ template<typename dst_t>
+ static void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
+                                   const sycl::nd_item<3> &item_ct1) {
+@@ -537,6 +582,63 @@ static void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restri
+ #endif
+ }
+ 
++template <typename dst_t>
++static void dequantize_block_q5_K_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
++                                          uint8_t * scales_local, const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
++    const int64_t ib = item_ct1.get_group(2);
++
++#if QK_K == 256
++    // assume 64 threads
++    const int64_t tid = item_ct1.get_local_id(2);
++    const int64_t il  = tid / 16;   // 0...3
++    const int64_t ir  = tid % 16;   // 0...15
++    const int64_t is  = 2 * il;
++
++    dst_t * y = yy + ib * QK_K + 64 * il + 2 * ir;
++
++    const uint8_t * base = static_cast<const uint8_t *>(vx);
++
++    // Reordered layout: [qs (QK_K/2 per block)] [qh (QK_K/8 per block)] [scales (K_SCALE_SIZE per block)] [dm (half2 per block)]
++    const size_t qs_offset     = ib * (QK_K / 2);
++    const size_t qh_offset     = n_blocks * (QK_K / 2) + ib * (QK_K / 8);
++    const size_t scales_offset = n_blocks * (QK_K / 2) + n_blocks * (QK_K / 8) + ib * K_SCALE_SIZE;
++    const size_t dm_offset     = n_blocks * (QK_K / 2) + n_blocks * (QK_K / 8) + n_blocks * K_SCALE_SIZE + ib * sizeof(ggml_half2);
++
++    const uint8_t *  qs_ptr     = base + qs_offset;
++    const uint8_t *  qh_ptr     = base + qh_offset;
++    const uint8_t *  scales_ptr = base + scales_offset;
++    const ggml_half2 dm_values  = *reinterpret_cast<const ggml_half2 *>(base + dm_offset);
++
++    const float dall = dm_values.x();
++    const float dmin = dm_values.y();
++
++    const uint8_t * ql = qs_ptr + 32 * il + 2 * ir;
++    const uint8_t * qh = qh_ptr + 2 * ir;
++
++    if (tid < K_SCALE_SIZE) {
++        scales_local[tid] = scales_ptr[tid];
++    }
++
++    item_ct1.barrier(sycl::access::fence_space::local_space);
++
++    uint8_t sc, m;
++    get_scale_min_k4(is + 0, scales_local, sc, m);
++    const float d1 = dall * sc; const float m1 = dmin * m;
++    get_scale_min_k4(is + 1, scales_local, sc, m);
++    const float d2 = dall * sc; const float m2 = dmin * m;
++
++    uint8_t hm  = 1 << (2 * il);
++    y[ 0] = d1 * ((ql[ 0] & 0xF) + (qh[ 0] & hm ? 16 : 0)) - m1;
++    y[ 1] = d1 * ((ql[ 1] & 0xF) + (qh[ 1] & hm ? 16 : 0)) - m1;
++    hm <<= 1;
++    y[32] = d2 * ((ql[ 0] >>  4) + (qh[ 0] & hm ? 16 : 0)) - m2;
++    y[33] = d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2;
++#else
++    GGML_UNUSED(ib); GGML_UNUSED(tid); GGML_UNUSED(yy); GGML_UNUSED(scales_local); GGML_UNUSED(n_blocks);
++    GGML_ABORT("Q5_K reorder dequantize not supported for QK_K != 256");
++#endif
++}
++
+ template<typename dst_t>
+ static void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                   const sycl::nd_item<3> &item_ct1) {
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index c02a41ad8..799b13711 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -63,6 +63,7 @@ int g_ggml_sycl_disable_graph = 0;
+ int g_ggml_sycl_disable_dnn = 0;
+ int g_ggml_sycl_prioritize_dmmv = 0;
+ int g_ggml_sycl_use_async_mem_op = 0;
++int g_ggml_sycl_use_async_mem_op_requested = 1;
+ int g_ggml_sycl_enable_flash_attention = 1;
+ 
+ 
+@@ -262,6 +263,8 @@ static void ggml_check_sycl() try {
+         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
+ #endif
+         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
++        g_ggml_sycl_use_async_mem_op_requested = get_sycl_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1);
++        GGML_LOG_INFO("  GGML_SYCL_USE_ASYNC_MEM_OP: %d\n", g_ggml_sycl_use_async_mem_op_requested);
+ 
+ #ifdef SYCL_FLASH_ATTN
+         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
+@@ -277,11 +280,11 @@ static void ggml_check_sycl() try {
+         fprintf(stderr, "%s: SYCL_USE_XMX: no\n", __func__);
+ #endif
+ */
+-        // Currently, we only use async malloc / free when graphs are enabled as it is required for the calls to be
+-        // properly recorded. As this SYCL extension matures it may be beneficial to enable as the default path and in
+-        // other places.
++        // Async USM allocation/free is also useful outside the graph path: it avoids the host waits in the reorder
++        // staging path while preserving queue ordering semantics. Graph support still depends on the extension being
++        // available, but it no longer needs to control the non-graph fast path.
+ #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
+-        g_ggml_sycl_use_async_mem_op = !g_ggml_sycl_disable_graph;
++        g_ggml_sycl_use_async_mem_op = g_ggml_sycl_use_async_mem_op_requested;
+         if (g_ggml_sycl_use_async_mem_op) {
+             for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count(); ++i) {
+                 if (!dpct::dev_mgr::instance().get_device(i).has(sycl::aspect::ext_oneapi_async_memory_alloc)) {
+@@ -2178,6 +2181,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
+ #endif
+     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
+         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
++        // NOTE: Fused dequant+GEMM and MMQ/DPAS were both attempted (Steps 10-11
++        // in optimization-workbook.md) but are slower than dequant+oneDNN.
+         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
+         if (src0->type != GGML_TYPE_F16) {
+             scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
+@@ -3261,9 +3266,12 @@ enum class mul_mat_algo {
+ };
+ 
+ inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
+-    // TODO: accuracy issues in MMQ
+-    GGML_UNUSED(type);
+-    return false;
++    // DPAS INT8 MMQ kernel exists in mmq.cpp but is slower than dequant+oneDNN.
++    // Disabled pending further optimization. See optimization-workbook.md Step 11.
++    switch (type) {
++        default:
++            return false;
++    }
+ }
+ 
+ inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
+@@ -3272,6 +3280,7 @@ inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
+         case GGML_TYPE_Q8_0:
+             return true;
+         case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K:
+         case GGML_TYPE_Q6_K:
+             return !g_ggml_sycl_prioritize_dmmv;
+         default:
+@@ -3294,6 +3303,7 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
+         case GGML_TYPE_Q4_0:
+         case GGML_TYPE_Q8_0:
+         case GGML_TYPE_Q4_K:
++        case GGML_TYPE_Q5_K:
+         case GGML_TYPE_Q6_K:
+             return true;
+         default:
+@@ -3510,6 +3520,54 @@ static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
+     return true;
+ }
+ 
++static bool reorder_qw_q5_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
++    GGML_ASSERT(size % sizeof(block_q5_K) == 0);
++    GGML_ASSERT(offset % sizeof(block_q5_K) == 0);
++
++    const int nblocks = size / sizeof(block_q5_K);
++
++    sycl_reorder_temp_buffer tmp(stream, size);
++    if (!tmp) {
++        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
++        return false;
++    }
++    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
++
++    sycl::event copy_event;
++    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
++    if (!g_ggml_sycl_use_async_mem_op) {
++        copy_event.wait();
++    }
++
++    auto * qs_ptr     = data_device;
++    auto * qh_ptr     = qs_ptr + (QK_K / 2) * nblocks;
++    auto * scales_ptr = qh_ptr + (QK_K / 8) * nblocks;
++    auto * dm_ptr     = (sycl::half2 *) (scales_ptr + K_SCALE_SIZE * nblocks);
++
++    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
++        const block_q5_K * x  = (const block_q5_K *) tmp_buf;
++        const int          ib = i;
++
++        for (int j = 0; j < QK_K / 2; ++j) {
++            qs_ptr[ib * (QK_K / 2) + j] = x[ib].qs[j];
++        }
++
++        for (int j = 0; j < QK_K / 8; ++j) {
++            qh_ptr[ib * (QK_K / 8) + j] = x[ib].qh[j];
++        }
++
++        for (int j = 0; j < K_SCALE_SIZE; ++j) {
++            scales_ptr[ib * K_SCALE_SIZE + j] = x[ib].scales[j];
++        }
++
++        dm_ptr[ib] = x[ib].dm;
++    });
++    if (!g_ggml_sycl_use_async_mem_op) {
++        reorder_event.wait_and_throw();
++    }
++    return true;
++}
++
+ static bool reorder_qw_q6_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
+     GGML_ASSERT(size % sizeof(block_q6_K) == 0);
+     GGML_ASSERT(offset % sizeof(block_q6_K) == 0);
+@@ -3576,6 +3634,8 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+             return reorder_qw_q8_0(data_device, ncols, nrows, size, 0, stream);
+         case GGML_TYPE_Q4_K:
+             return reorder_qw_q4_k(data_device, size, 0, stream);
++        case GGML_TYPE_Q5_K:
++            return reorder_qw_q5_k(data_device, size, 0, stream);
+         case GGML_TYPE_Q6_K:
+             return reorder_qw_q6_k(data_device, size, 0, stream);
+         default:
+diff --git a/ggml/src/ggml-sycl/mmq.cpp b/ggml/src/ggml-sycl/mmq.cpp
+index ffb272aa2..79969184a 100644
+--- a/ggml/src/ggml-sycl/mmq.cpp
++++ b/ggml/src/ggml-sycl/mmq.cpp
+@@ -13,6 +13,11 @@
+ #include "mmq.hpp"
+ #include "vecdotq.hpp"
+ 
++// Note: MMQ tile layout assumes WARP_SIZE >= 32 (QI4_K = QI5_K = QI6_K = 32).
++// Intel targets set WARP_SIZE=16 (native subgroup size), which makes MMQ dp4a
++// kernels non-functional. MMQ dispatch is disabled in ggml_sycl_supports_mmq().
++// See optimization-workbook.md Step 11 for DPAS upgrade attempt and results.
++
+ typedef void (*allocate_tiles_sycl_t)(
+     int** x_ql,
+     sycl::half2** x_dm,
+@@ -1831,7 +1836,7 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q4_0<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -1866,7 +1871,7 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q4_0<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -1946,7 +1951,7 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q4_1<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -1981,7 +1986,7 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q4_1<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2061,7 +2066,7 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q5_0<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2096,7 +2101,7 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q5_0<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2176,7 +2181,7 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q5_1<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2211,7 +2216,7 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q5_1<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2291,7 +2296,7 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q8_0<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2326,7 +2331,7 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q8_0<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2408,7 +2413,7 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q2_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2446,7 +2451,7 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q2_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2533,7 +2538,7 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q3_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2574,7 +2579,7 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q3_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2659,7 +2664,7 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q4_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2697,7 +2702,7 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q4_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2780,7 +2785,7 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q5_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2818,7 +2823,7 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q5_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2901,7 +2906,7 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q6_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+@@ -2939,7 +2944,7 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *vx, const void *vy,
+ 
+                 cgh.parallel_for(
+                     sycl::nd_range<3>(block_nums * block_dims, block_dims),
+-                    [=](sycl::nd_item<3> item_ct1) {
++                    [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+                         mul_mat_q6_K<need_check>(
+                             vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                             nrows_dst, item_ct1,
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index af22b98dd..75d9f040a 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -722,6 +722,26 @@ static void mul_mat_vec_q8_0_q8_1_sycl(const void *vx, const void *vy,
+     }
+ }
+ 
++static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
++                                               const int nrows, dpct::queue_ptr stream) {
++    GGML_ASSERT(ncols % QK8_0 == 0);
++
++    const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
++    constexpr size_t num_subgroups = 16;
++    GGML_ASSERT(block_num_y % num_subgroups == 0);
++
++    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
++    const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
++
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(sycl::nd_range<3>(global_size, workgroup_size),
++                            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(vx, vy, dst, ncols,
++                                                                                            nrows, nd_item);
++                            });
++    });
++}
++
+ static void mul_mat_vec_q2_K_q8_1_sycl(const void *vx, const void *vy,
+                                        float *dst, const int ncols,
+                                        const int nrows,
+@@ -839,6 +859,26 @@ static void mul_mat_vec_q5_K_q8_1_sycl(const void *vx, const void *vy,
+     }
+ }
+ 
++static void reorder_mul_mat_vec_q5_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
++                                               const int nrows, dpct::queue_ptr stream) {
++    GGML_ASSERT(ncols % QK_K == 0);
++
++    const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
++    constexpr size_t num_subgroups = 16;
++    GGML_ASSERT(block_num_y % num_subgroups == 0);
++
++    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
++    const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
++
++    stream->submit([&](sycl::handler & cgh) {
++        cgh.parallel_for(sycl::nd_range<3>(global_size, workgroup_size),
++                            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>>(vx, vy, dst, ncols,
++                                                                                            nrows, nd_item);
++                            });
++    });
++}
++
+ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
+                                                const int nrows, dpct::queue_ptr stream) {
+     GGML_ASSERT(ncols % QK_K == 0);
+@@ -1125,6 +1165,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                     GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl\n");
+                     reorder_mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 } else {
++                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q8_0_q8_1_sycl\n");
+                     mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                 }
+                 break;
+@@ -1145,7 +1186,14 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
+                 }
+                 break;
+             case GGML_TYPE_Q5_K:
+-                mul_mat_vec_q5_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
++                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
++                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
++                    GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q5_k_q8_1_sycl\n");
++                    reorder_mul_mat_vec_q5_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
++                } else {
++                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q5_K_q8_1_sycl\n");
++                    mul_mat_vec_q5_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
++                }
+                 break;
+             case GGML_TYPE_Q6_K:
+                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+diff --git a/ggml/src/ggml-sycl/quants.hpp b/ggml/src/ggml-sycl/quants.hpp
+index 1f5b62740..806028ef3 100644
+--- a/ggml/src/ggml-sycl/quants.hpp
++++ b/ggml/src/ggml-sycl/quants.hpp
+@@ -79,6 +79,31 @@ template <> struct block_q_t<GGML_TYPE_Q4_K> {
+     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+ };
+ 
++template <> struct block_q_t<GGML_TYPE_Q5_K> {
++    struct traits {
++        static constexpr uint32_t qk       = QK_K;
++        static constexpr uint32_t qi       = QI5_K;
++        static constexpr uint32_t qr       = QR5_K;
++        static constexpr uint32_t vdr_mmvq = 2;
++    };
++
++    // Reordered layout: [qs (QK_K/2 per block)] [qh (QK_K/8 per block)] [scales] [dm]
++    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int n_blocks) {
++        auto qs_offset = block_index * (QK_K / 2);
++        auto qh_offset = n_blocks * (QK_K / 2) + block_index * (QK_K / 8);
++        return { qs_offset, qh_offset };
++    }
++
++    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
++        auto nblocks        = (nrows * (ncols / QK_K));
++        auto total_qs_bytes = nblocks * (QK_K / 2) + nblocks * (QK_K / 8);
++        return { total_qs_bytes + block_index * K_SCALE_SIZE,
++                 total_qs_bytes + nblocks * K_SCALE_SIZE + block_index * sizeof(ggml_half2) };
++    }
++
++    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
++};
++
+ template <> struct block_q_t<GGML_TYPE_Q6_K> {
+     struct traits {
+         static constexpr uint32_t qk       = QK_K;
+diff --git a/ggml/src/ggml-sycl/vecdotq.hpp b/ggml/src/ggml-sycl/vecdotq.hpp
+index 9253168e5..16b2d65d2 100644
+--- a/ggml/src/ggml-sycl/vecdotq.hpp
++++ b/ggml/src/ggml-sycl/vecdotq.hpp
+@@ -85,6 +85,32 @@ static __dpct_inline__ int get_int_from_uint8_aligned(
+       (const int*)(x8 + sizeof(int) * i32)); // assume at least 4 byte alignment
+ }
+ 
++static __dpct_inline__ int byte_sub_4(const int a, const int b) {
++  const uint32_t ua = static_cast<uint32_t>(a);
++  const uint32_t ub = static_cast<uint32_t>(b);
++  return static_cast<int>(((ua | 0x80808080u) - ub) ^ 0x80808080u);
++}
++
++static __dpct_inline__ float vec_dot_q6_K_q8_1_impl_mmvq_scalar(
++    const int vl, const int vh, const int u0, const int u1, const int8_t sc0,
++    const int8_t sc1, const float d, const float d80, const float d81) {
++    static_assert(QR6_K == 2, "q6_K MMVQ scalar fast path assumes QR6_K == 2");
++
++    const int vil0 = (vl >> 0) & 0x0F0F0F0F;
++    const int vih0 = ((vh >> 0) << 4) & 0x30303030;
++    const int vi0 = byte_sub_4(vil0 | vih0, 0x20202020);
++
++    const int vil1 = (vl >> 4) & 0x0F0F0F0F;
++    const int vih1 = ((vh >> 4) << 4) & 0x30303030;
++    const int vi1 = byte_sub_4(vil1 | vih1, 0x20202020);
++
++    const float sumf =
++        d80 * (dpct::dp4a(vi0, u0, 0) * sc0) +
++        d81 * (dpct::dp4a(vi1, u1, 0) * sc1);
++
++    return d * sumf;
++}
++
+ static __dpct_inline__ void get_int_from_table_16(const uint32_t &q4,
+                                                   const uint8_t *values,
+                                                   int &val1, int &val2) {
+@@ -279,24 +305,8 @@ vec_dot_q6_K_q8_1_impl_mmvq(const int &vl, const int &vh,
+                             const int *__restrict__ u,
+                             const int8_t *__restrict__ scales, const float &d,
+                             const float *__restrict__ d8) {
+-
+-    float sumf = 0.0f;
+-
+-#pragma unroll
+-    for (int i = 0; i < QR6_K; ++i) {
+-        const int sc = scales[4*i];
+-
+-        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+-
+-        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+-
+-        const int vi = dpct::vectorized_binary<sycl::char4>(
+-            (vil | vih), 0x20202020, dpct::sub_sat()); // vi = (vil | vih) - 32
+-
+-        sumf += d8[i] * (dpct::dp4a(vi, u[i], 0) * sc); // SIMD dot product
+-    }
+-
+-    return d*sumf;
++    return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
++        vl, vh, u[0], u[1], scales[0], scales[4], d, d8[0], d8[1]);
+ }
+ 
+ // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
+@@ -357,38 +367,31 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
+     using q8_0_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>;
+     using q8_0_traits = typename q8_0_block::traits;
+ 
+-    __dpct_inline__ float vec_dot_q8_0_q8_1_impl(const int * v, const int * u, const float & d8_0, const sycl::half2 & ds8) {
+-        int sumi = 0;
+-
+-#pragma unroll
+-        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
+-            // Q8_0 values are signed int8, no nibble extraction needed
+-            // Direct dp4a: each int packs 4 int8 values
+-            sumi = dpct::dp4a(v[i], u[i], sumi);
+-        }
+-
+-        const sycl::float2 ds8f = ds8.convert<float, sycl::rounding_mode::automatic>();
+-
+-        // Q8_0 has no bias term (values are signed), so just scale
+-        return d8_0 * sumi * ds8f.x();
+-    }
+-
+     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                      const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                      const sycl::half2 * q8_1_ds, const int & iqs) {
+-        const int8_t * bq8_0 = static_cast<const int8_t *>(vbq) + ibx_offset.first;
+-        const ggml_half d = *(reinterpret_cast<const ggml_half *>(static_cast<const uint8_t *>(vbq) + d_offset.first));
+-        int             v[q8_0_traits::vdr_mmvq];
+-        int             u[q8_0_traits::vdr_mmvq];
++        const uint8_t * base = static_cast<const uint8_t *>(vbq);
++        const int8_t *  qs   = reinterpret_cast<const int8_t *>(base + ibx_offset.first);
++        const ggml_half  d   = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
++
++        int v[q8_0_traits::vdr_mmvq];
++        int u[q8_0_traits::vdr_mmvq];
+ 
+ #pragma unroll
+         for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
+-            v[i] = get_int_from_int8(bq8_0, iqs + i);
++            v[i] = get_int_from_int8(qs, iqs + i);
+             u[i] = get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i);
+         }
+ 
+-        return vec_dot_q8_0_q8_1_impl(v, u, d, *q8_1_ds);
+-    };
++        int sumi = 0;
++#pragma unroll
++        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
++            sumi = dpct::dp4a(v[i], u[i], sumi);
++        }
++
++        const sycl::half2 ds_values = *q8_1_ds;
++        return static_cast<float>(d) * static_cast<float>(ds_values[0]) * sumi;
++    }
+ };
+ 
+ static inline float vec_dot_q4_K_q8_1_common(const int * __restrict__ q4, const uint16_t * __restrict__ scales,
+@@ -481,32 +484,76 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K> {
+     }
+ };
+ 
+-template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
+-    static constexpr ggml_type gtype = GGML_TYPE_Q6_K;
++template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K> {
++    static constexpr ggml_type gtype = GGML_TYPE_Q5_K;
+ 
+-    using q6_k_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q6_K>;
+-    using q6_k_traits = typename q6_k_block::traits;
++    using q5_k_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q5_K>;
++    using q5_k_traits = typename q5_k_block::traits;
+ 
+-    __dpct_inline__ float vec_dot_q6_K_q8_1_impl_mmvq(const int vl, const int vh, const int * __restrict__ u,
+-                                                      const int8_t * __restrict__ scales, const float d,
+-                                                      const float * __restrict__ d8) {
+-        float sumf = 0.0f;
++    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
++                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
++                                     const sycl::half2 * q8_1_ds, const int & iqs) {
++        const uint8_t *    base           = static_cast<const uint8_t *>(vbq);
++        const uint8_t *    qs             = base + ibx_offset.first;   // low 4 bits
++        const uint8_t *    qh_base        = base + ibx_offset.second;  // high bit
++        const uint8_t *    scs            = base + d_offset.first;
++        const ggml_half2 * dms            = reinterpret_cast<const ggml_half2 *>(base + d_offset.second);
+ 
+-#pragma unroll
+-        for (int i = 0; i < QR6_K; ++i) {
+-            const int sc = scales[4 * i];
++        const int        bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
++        const int *      ql_ptr     = (const int *) (qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
++        const int *      qh_ptr     = (const int *) (qh_base + 4 * ((iqs / 2) % 4));
++        const uint16_t * scales     = (const uint16_t *) scs;
++
++        int   vl[2];
++        int   vh[2];
++        int   u[2 * QR5_K];
++        float d8[QR5_K];
++
++        vl[0] = ql_ptr[0];
++        vl[1] = ql_ptr[4];
++
++        vh[0] = qh_ptr[0] >> bq8_offset;
++        vh[1] = qh_ptr[4] >> bq8_offset;
+ 
+-            const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
++        uint16_t  aux[2];
++        const int j = (QR5_K * ((iqs / 2) / (QI8_1 / 2))) / 2;
++        if (j < 2) {
++            aux[0] = scales[j + 0] & 0x3f3f;
++            aux[1] = scales[j + 2] & 0x3f3f;
++        } else {
++            aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
++            aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
++        }
++
++        const uint8_t * sc = (const uint8_t *) aux;
++        const uint8_t * m  = sc + 2;
+ 
+-            const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
++        for (int i = 0; i < QR5_K; ++i) {
++            const int8_t* quant_base_ptr = q8_1_quant_ptr + (bq8_offset + i) * QK8_1;
++            sycl::half2 ds_values = *(q8_1_ds + bq8_offset + i);
+ 
+-            const int vi = dpct::vectorized_binary<sycl::char4>((vil | vih), 0x20202020,
+-                                                                dpct::sub_sat());  // vi = (vil | vih) - 32
++            d8[i]                   = ds_values[0];
+ 
+-            sumf += d8[i] * (dpct::dp4a(vi, u[i], 0) * sc);                        // SIMD dot product
++            const int * q8 = (const int *) quant_base_ptr + ((iqs / 2) % 4);
++            u[2 * i + 0]   = q8[0];
++            u[2 * i + 1]   = q8[4];
+         }
+ 
+-        return d * sumf;
++        return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, *dms, d8);
++    }
++};
++
++template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
++    static constexpr ggml_type gtype = GGML_TYPE_Q6_K;
++
++    using q6_k_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q6_K>;
++    using q6_k_traits = typename q6_k_block::traits;
++
++    __dpct_inline__ float vec_dot_q6_K_q8_1_impl_mmvq(const int vl, const int vh, const int * __restrict__ u,
++                                                      const int8_t * __restrict__ scales, const float d,
++                                                      const float * __restrict__ d8) {
++        return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
++            vl, vh, u[0], u[1], scales[0], scales[4], d, d8[0], d8[1]);
+     }
+ 
+     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+@@ -527,16 +574,15 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
+ 
+         const int8_t * scs = scales + scale_offset;
+ 
+-        int   u[QR6_K];
+-        float d8[QR6_K];
++        const int u0 = get_int_from_int8_aligned(
++            q8_1_quant_ptr + bq8_offset * QK8_1, iqs % QI8_1);
++        const int u1 = get_int_from_int8_aligned(
++            q8_1_quant_ptr + (bq8_offset + 2) * QK8_1, iqs % QI8_1);
++        const float d80 = (*(q8_1_ds + bq8_offset + 0))[0];
++        const float d81 = (*(q8_1_ds + bq8_offset + 2))[0];
+ 
+-#pragma unroll
+-        for (int i = 0; i < QR6_K; ++i) {
+-            u[i] = get_int_from_int8_aligned(q8_1_quant_ptr + (bq8_offset + 2 * i) * QK8_1, iqs % QI8_1);
+-            const sycl::half2 ds_values = *(q8_1_ds + bq8_offset + 2 * i);
+-            d8[i]                       = ds_values[0];
+-        }
+-        return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scs, *d, d8);
++        return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
++            vl, vh, u0, u1, scs[0], scs[4], *d, d80, d81);
+     }
+ };
+ #define VDR_Q4_0_Q8_1_MMVQ 2
+@@ -1115,16 +1161,15 @@ vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
+ 
+     const int8_t * scales = bq6_K->scales + scale_offset;
+ 
+-    int    u[QR6_K];
+-    float d8[QR6_K];
+-
+-#pragma unroll
+-    for (int i = 0; i < QR6_K; ++i) {
+-        u[i]  = get_int_from_int8_aligned(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+-        d8[i] = bq8_1[bq8_offset + 2 * i].ds[0];
+-    }
++    const int u0 = get_int_from_int8_aligned(
++        bq8_1[bq8_offset + 0].qs, iqs % QI8_1);
++    const int u1 = get_int_from_int8_aligned(
++        bq8_1[bq8_offset + 2].qs, iqs % QI8_1);
++    const float d80 = bq8_1[bq8_offset + 0].ds[0];
++    const float d81 = bq8_1[bq8_offset + 2].ds[0];
+ 
+-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
++    return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
++        vl, vh, u0, u1, scales[0], scales[4], bq6_K->d, d80, d81);
+ }
+ 
+ 
+-- 
+2.48.1
+
