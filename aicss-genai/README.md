@@ -184,23 +184,7 @@ python aicss-genai/scripts/verify_bench_models.py
 
 ### 4. Benchmark
 
-### 4a. Single-Model Benchmark (qwen3.5-9b used as the default)
-
-Run a full benchmark sweep across prompt and generation token counts:
-
-```bash
-./aicss-genai/scripts/run_qwen9b_sycl_bench.sh [model_path]
-```
-
-Defaults to `models/Qwen3.5-9B-Q4_K_M.gguf`. Runs warmup, then scored
-runs with `pp512-8192 × tg128-1024 × r=5`. Results land in
-`results/<date-time>/`.
-
-Everything is configurable via env vars — see the script header for the
-full list (`LLAMA_BENCH_PROMPT_TOKENS`, `LLAMA_BENCH_GEN_TOKENS`,
-`LLAMA_BENCH_REPS`, etc.).
-
-### 4b. Full Multi-Model Benchmark (All Models in Manifest)
+### Full Single/Multi-Model Benchmark (Defined Models in Manifest File)
 
 Run llama-bench across every model in
 `aicss-genai/scripts/bench_models_manifest.tsv`, automatically
