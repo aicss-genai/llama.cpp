@@ -273,7 +273,7 @@ UR_L0_USE_IMMEDIATE_COMMANDLISTS=1 \
     ./aicss-genai/scripts/bench_all_models_parallel_gpu.sh
 ```
 
-### 4c. Parse Results
+### Parse Results
 
 Parse a timestamped results directory into a report. The bench script
 auto-generates a CSV on completion; use `result_parser.py` directly for
