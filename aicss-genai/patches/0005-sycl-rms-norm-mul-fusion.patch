@@ -16,16 +16,72 @@ Verified: tg128 +5.5% on Qwen3.5-9B Q4_K_M, Intel Arc Pro B70.
  3 files changed, 154 insertions(+)
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 99c605b39..70793704b 100644
+index 99c605b39..b9368ee78 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -4523,6 +4523,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -4512,6 +4512,55 @@ catch (sycl::exception const &exc) {
+   std::exit(1);
+ }
+ 
++static bool ggml_sycl_can_fuse(ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
++    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
++        return false;
++    }
++
++    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
++        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
++        const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
++        const ggml_tensor * add      = nullptr;
++
++        if (ops.size() == 3 && ops.begin()[2] == GGML_OP_ADD) {
++            add = cgraph->nodes[node_idx + 2];
++        }
++
++        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
++        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
++
++        if (mul->src[0]->type != GGML_TYPE_F32 ||
++            mul->src[1]->type != GGML_TYPE_F32 ||
++            mul->type != GGML_TYPE_F32) {
++            return false;
++        }
++
++        if (add && (add->src[0]->type != GGML_TYPE_F32 ||
++            add->src[1]->type != GGML_TYPE_F32 ||
++            add->type != GGML_TYPE_F32)) {
++            return false;
++        }
++
++        // If rms_norm is the B operand, this fusion path does not support expansion of the A operand.
++        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
++            return false;
++        }
++
++        // rms_norm kernel assumes contiguous rows.
++        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
++            return false;
++        }
++
++        if (add && (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous_rows(add->src[1]))) {
++            return false;
++        }
++
++        return true;
++    }
++
++    return true;
++}
++
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_set_main_device(sycl_ctx->device);
+ 
+@@ -4523,6 +4572,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
              continue;
          }
 +
 +        if (node->op == GGML_OP_RMS_NORM &&
-+            ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
++            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
 +            ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
 +            i++;
 +            continue;
@@ -35,10 +91,10 @@ index 99c605b39..70793704b 100644
          assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
          for (int j = 0; j < GGML_MAX_SRC; j++) {
 diff --git a/ggml/src/ggml-sycl/norm.cpp b/ggml/src/ggml-sycl/norm.cpp
-index 09fce1280..8612eea75 100644
+index 09fce1280..0ba6a7b72 100644
 --- a/ggml/src/ggml-sycl/norm.cpp
 +++ b/ggml/src/ggml-sycl/norm.cpp
-@@ -202,6 +202,62 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols, const int6
+@@ -202,6 +202,68 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols, const int6
      }
  }
  
@@ -47,6 +103,8 @@ index 09fce1280..8612eea75 100644
 +        const int64_t stride_sample,
 +        const int64_t mul_stride_row, const int64_t mul_stride_channel,
 +        const int64_t mul_stride_sample,
++        const int64_t mul_ncols, const int64_t mul_nrows,
++        const int64_t mul_nchannels, const int64_t mul_nsamples,
 +        const float eps, const sycl::nd_item<3> & item_ct1, float * s_sum, int block_size) {
 +
 +    const int nrows     = item_ct1.get_group_range(2);
@@ -64,7 +122,10 @@ index 09fce1280..8612eea75 100644
 +    x   += strided_offset;
 +    dst += packed_offset;
 +
-+    const auto mul_offset = calculate_offset<3>({mul_stride_sample, mul_stride_channel, mul_stride_row}, {sample, channel, row});
++    const auto mul_row     = row % mul_nrows;
++    const auto mul_channel = channel % mul_nchannels;
++    const auto mul_sample  = sample % mul_nsamples;
++    const auto mul_offset  = calculate_offset<3>({mul_stride_sample, mul_stride_channel, mul_stride_row}, {mul_sample, mul_channel, mul_row});
 +    mul += mul_offset;
 +
 +    float tmp = 0.0f;
@@ -94,14 +155,15 @@ index 09fce1280..8612eea75 100644
 +    const float scale = sycl::rsqrt(mean + eps);
 +
 +    for (int col = tid; col < ncols; col += block_size) {
-+        dst[col] = scale * x[col] * mul[col];
++        const auto mul_col = col % mul_ncols;
++        dst[col] = scale * x[col] * mul[mul_col];
 +    }
 +}
 +
  template<int warp_size>
  static void l2_norm_f32(const float * x, float * dst, const int ncols,
      const int64_t stride_row, const int64_t stride_channel,
-@@ -356,6 +412,41 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
+@@ -356,6 +418,44 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
      }
  }
  
@@ -109,6 +171,7 @@ index 09fce1280..8612eea75 100644
 +        const int ncols, const int nrows, const int nchannels, const int nsamples,
 +        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
 +        const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
++        const int64_t mul_ncols, const int64_t mul_nrows, const int64_t mul_nchannels, const int64_t mul_nsamples,
 +        const float eps, queue_ptr stream, int device) {
 +
 +    const sycl::range<3> global_dims(nsamples, nchannels, nrows);
@@ -120,6 +183,7 @@ index 09fce1280..8612eea75 100644
 +                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
 +                    rms_norm_mul_f32(x, mul, dst, ncols, stride_row, stride_channel, stride_sample,
 +                                     mul_stride_row, mul_stride_channel, mul_stride_sample,
++                                     mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
 +                                     eps, item_ct1, nullptr, WARP_SIZE);
 +                });
 +        });
@@ -134,6 +198,7 @@ index 09fce1280..8612eea75 100644
 +                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
 +                    rms_norm_mul_f32(x, mul, dst, ncols, stride_row, stride_channel, stride_sample,
 +                                     mul_stride_row, mul_stride_channel, mul_stride_sample,
++                                     mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
 +                                     eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size);
 +                });
 +        });
@@ -143,7 +208,7 @@ index 09fce1280..8612eea75 100644
  template<int warp_size>
  static void l2_norm_f32_sycl(const float *   x,
                               float *         dst,
-@@ -472,6 +563,59 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+@@ -472,6 +572,65 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
      rms_norm_f32_sycl(src0_dd, dst_dd, ne00, ne01, ne02, ne03, s01, s02, s03, eps, main_stream, ctx.device);
  }
  
@@ -193,10 +258,16 @@ index 09fce1280..8612eea75 100644
 +    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
 +    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
 +
++    const int64_t mul_ne00 = mul_src->ne[0];
++    const int64_t mul_ne01 = mul_src->ne[1];
++    const int64_t mul_ne02 = mul_src->ne[2];
++    const int64_t mul_ne03 = mul_src->ne[3];
++
 +    rms_norm_mul_f32_sycl(src0_dd, mul_dd, dst_dd,
 +                           ne00, ne01, ne02, ne03,
 +                           s01, s02, s03,
 +                           mul_s01, mul_s02, mul_s03,
++                           mul_ne00, mul_ne01, mul_ne02, mul_ne03,
 +                           eps, main_stream, ctx.device);
 +}
 +
