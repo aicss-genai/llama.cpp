@@ -70,7 +70,7 @@
 #include "ggml-sycl/diag.hpp"
 #include "ggml-sycl/solve_tri.hpp"
 #include "ggml-sycl/gated_delta_net.hpp"
-#include "ggml-sycl/fused-q4k-swiglu.hpp"
+#include "ggml-sycl/ffn.hpp"
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
@@ -4633,9 +4633,6 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                     ggml_sycl_geglu(ctx, dst);
                     break;
                 case GGML_GLU_OP_SWIGLU:
-                    if (ggml_sycl_try_fused_q4k_swiglu(ctx, dst)) {
-                        break;
-                    }
                     ggml_sycl_swiglu(ctx, dst);
                     break;
                 case GGML_GLU_OP_SWIGLU_OAI:
@@ -4955,12 +4952,21 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-static bool ggml_sycl_can_fuse(ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
-    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+static inline bool ggml_sycl_is_reordered_q4k_for_fusion(const ggml_tensor * w) {
+    if (w == nullptr || w->type != GGML_TYPE_Q4_K) {
         return false;
     }
 
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(w->extra);
+    return extra != nullptr && extra->optimized_feature.reorder;
+}
+
+static bool ggml_sycl_can_fuse(ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+        if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+            return false;
+        }
+
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
         const ggml_tensor * add      = nullptr;
@@ -5001,7 +5007,90 @@ static bool ggml_sycl_can_fuse(ggml_cgraph * cgraph, int node_idx, std::initiali
         return true;
     }
 
-    return true;
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_MUL_MAT && ops.begin()[2] == GGML_OP_GLU) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx,
+                                    { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU },
+                                    { node_idx + 2 })) {
+            return false;
+        }
+
+        if (!g_ggml_sycl_enable_fused_q4k_swiglu) {
+            return false;
+        }
+
+        const ggml_tensor * mul_mat_0    = cgraph->nodes[node_idx];
+        const ggml_tensor * mul_mat_1    = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * swiglu_dst   = cgraph->nodes[node_idx + 2];
+
+        if ((swiglu_dst->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+
+        if (ggml_get_glu_op(swiglu_dst) != GGML_GLU_OP_SWIGLU) {
+            return false;
+        }
+
+        if (!((swiglu_dst->src[0] == mul_mat_0 || swiglu_dst->src[1] == mul_mat_0) &&
+              (swiglu_dst->src[0] == mul_mat_1 || swiglu_dst->src[1] == mul_mat_1))) {
+            return false;
+        }
+
+        const ggml_tensor * gate_mul_mat = swiglu_dst->src[0];
+        const ggml_tensor * up_mul_mat   = swiglu_dst->src[1];
+
+        const ggml_tensor * w_gate = gate_mul_mat->src[0];
+        const ggml_tensor * x_gate = gate_mul_mat->src[1];
+        const ggml_tensor * w_up   = up_mul_mat->src[0];
+        const ggml_tensor * x_up   = up_mul_mat->src[1];
+
+        if (w_gate == nullptr || x_gate == nullptr || w_up == nullptr || x_up == nullptr) {
+            return false;
+        }
+
+        if (x_gate != x_up) {
+            return false;
+        }
+
+        if (!ggml_sycl_is_reordered_q4k_for_fusion(w_gate) || !ggml_sycl_is_reordered_q4k_for_fusion(w_up)) {
+            return false;
+        }
+
+        if (x_gate->type != GGML_TYPE_F32 || !ggml_is_contiguous(x_gate)) {
+            return false;
+        }
+
+        if (x_gate->ne[2] != 1 || x_gate->ne[3] != 1 || swiglu_dst->ne[2] != 1 || swiglu_dst->ne[3] != 1) {
+            return false;
+        }
+
+        if (gate_mul_mat->type != GGML_TYPE_F32 || up_mul_mat->type != GGML_TYPE_F32 || swiglu_dst->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous(gate_mul_mat) || !ggml_is_contiguous(up_mul_mat) || !ggml_is_contiguous(swiglu_dst)) {
+            return false;
+        }
+
+        const int64_t ncols = x_gate->ne[0];
+        const int64_t batch = x_gate->ne[1];
+        const int64_t nrows = swiglu_dst->ne[0];
+
+        if (w_gate->ne[0] != ncols || w_up->ne[0] != ncols || ncols % QK8_1 != 0 || ncols % QK_K != 0) {
+            return false;
+        }
+
+        if (w_gate->ne[1] != nrows || w_up->ne[1] != nrows || gate_mul_mat->ne[0] != nrows || up_mul_mat->ne[0] != nrows) {
+            return false;
+        }
+
+        if (gate_mul_mat->ne[1] != batch || up_mul_mat->ne[1] != batch || swiglu_dst->ne[1] != batch) {
+            return false;
+        }
+
+        return true;
+    }
+
+    return ggml_can_fuse(cgraph, node_idx, ops);
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
@@ -5013,6 +5102,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        // Scheduler-time subgraph fusion:
+        //   MUL_MAT(gate) + MUL_MAT(up) -> GLU(SWIGLU)
+        // Execute as a single fused kernel and skip the 3 unfused nodes.
+        if (node->op == GGML_OP_MUL_MAT &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) {
+            ggml_tensor * swiglu = cgraph->nodes[i + 2];
+            ggml_sycl_op_ffn_fused(*sycl_ctx, swiglu->src[0], swiglu->src[1], swiglu);
+            i += 2;
             continue;
         }
 
