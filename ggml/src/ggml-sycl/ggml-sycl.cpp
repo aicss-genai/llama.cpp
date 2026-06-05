@@ -70,6 +70,7 @@
 #include "ggml-sycl/diag.hpp"
 #include "ggml-sycl/solve_tri.hpp"
 #include "ggml-sycl/gated_delta_net.hpp"
+#include "ggml-sycl/fused-q4k-swiglu.hpp"
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
@@ -82,6 +83,7 @@ int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_enable_level_zero = 0;
 int g_ggml_sycl_enable_flash_attention = 1;
+int g_ggml_sycl_enable_fused_q4k_swiglu = 0;
 
 
 static ggml_sycl_device_info ggml_sycl_init() {
@@ -260,6 +262,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
         g_ggml_sycl_enable_vmm = get_sycl_env("GGML_SYCL_ENABLE_VMM", 1);
         g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+        g_ggml_sycl_enable_fused_q4k_swiglu = get_sycl_env("GGML_SYCL_ENABLE_FUSED_Q4K_SWIGLU", 0);
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
         g_ggml_sycl_enable_level_zero = get_sycl_env("GGML_SYCL_ENABLE_LEVEL_ZERO", ggml_sycl_info().ext_oneapi_level_zero);
 #else
@@ -330,6 +333,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: virtual memory extension is not available\n");
 #endif
         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_FUSED_Q4K_SWIGLU: %d\n", g_ggml_sycl_enable_fused_q4k_swiglu);
         g_ggml_sycl_use_async_mem_op_requested = get_sycl_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1);
         GGML_LOG_INFO("  GGML_SYCL_USE_ASYNC_MEM_OP: %d\n", g_ggml_sycl_use_async_mem_op_requested);
 
@@ -4629,6 +4633,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                     ggml_sycl_geglu(ctx, dst);
                     break;
                 case GGML_GLU_OP_SWIGLU:
+                    if (ggml_sycl_try_fused_q4k_swiglu(ctx, dst)) {
+                        break;
+                    }
                     ggml_sycl_swiglu(ctx, dst);
                     break;
                 case GGML_GLU_OP_SWIGLU_OAI:
