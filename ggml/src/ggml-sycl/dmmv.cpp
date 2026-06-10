@@ -598,6 +598,18 @@ static void dequantize_mul_mat_vec_q3_k_reorder(const void *__restrict__ vx,
     }
 }
 
+// Sub-group (SIMD) width used by the Q4_K dequantize-matvec kernel.
+// Defaults to QK_WARP_SIZE (32). Define GGML_SYCL_Q4K_DMMV_WARP=16 at build
+// time to A/B test a SIMD16 variant. The 256-element super-block is always
+// tiled by 16 distinct "tids"; the only thing that changes with the sub-group
+// width is how many lanes share a tid (n_ix = warp/16) and split the row's
+// blocks between them, plus the width of the final sub-group reduction.
+#ifndef GGML_SYCL_Q4K_DMMV_WARP
+#define GGML_SYCL_Q4K_DMMV_WARP QK_WARP_SIZE
+#endif
+static_assert(GGML_SYCL_Q4K_DMMV_WARP == 16 || GGML_SYCL_Q4K_DMMV_WARP == 32,
+              "GGML_SYCL_Q4K_DMMV_WARP must be 16 or 32");
+
 /*
 DPCT1110:6: The total declared local variable size in device function
 dequantize_mul_mat_vec_q4_k exceeds 128 bytes and may cause high register
@@ -624,10 +636,12 @@ static void dequantize_mul_mat_vec_q4_k(const void *__restrict__ vx,
     const uint16_t kmask2 = 0x0f0f;
     const uint16_t kmask3 = 0xc0c0;
 
-    const int tid =
-        item_ct1.get_local_id(2) / K_QUANTS_PER_ITERATION; // 0...31 or 0...16
-    const int ix =
-        item_ct1.get_local_id(2) % K_QUANTS_PER_ITERATION; // 0 or 0,1
+    // Lanes that share a tid and split the row's blocks between them:
+    // SIMD32 -> 2 lanes/tid (each lane strides by 2 over blocks),
+    // SIMD16 -> 1 lane/tid  (each lane processes every block).
+    constexpr int n_ix = GGML_SYCL_Q4K_DMMV_WARP / 16;
+    const int tid = item_ct1.get_local_id(2) / n_ix; // 0...15
+    const int ix  = item_ct1.get_local_id(2) % n_ix; // 0 (SIMD16) or 0,1 (SIMD32)
 
     const int step = 8/K_QUANTS_PER_ITERATION;           // 8 or 4
 
@@ -655,7 +669,7 @@ static void dequantize_mul_mat_vec_q4_k(const void *__restrict__ vx,
 
     float tmp = 0; // partial sum for thread in warp
 
-    for (int i = ix; i < num_blocks_per_row; i += K_QUANTS_PER_ITERATION) {
+    for (int i = ix; i < num_blocks_per_row; i += n_ix) {
 
         const float   * y1 = yy + i*QK_K + y_offset;
         const float   * y2 = y1 + 128;
@@ -741,7 +755,7 @@ static void dequantize_mul_mat_vec_q4_k(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = GGML_SYCL_Q4K_DMMV_WARP / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -1561,10 +1575,10 @@ static void dequantize_mul_mat_vec_q4_K_sycl(const void *vx, const float *y,
     const int ny = 2 / K_QUANTS_PER_ITERATION;
     const int block_num_y = (nrows + ny - 1) / ny;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, ny, QK_WARP_SIZE);
+    const sycl::range<3> block_dims(1, ny, GGML_SYCL_Q4K_DMMV_WARP);
     stream->parallel_for(
         sycl::nd_range<3>(block_nums * block_dims, block_dims),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(GGML_SYCL_Q4K_DMMV_WARP)]] {
             dequantize_mul_mat_vec_q4_k(vx, y, dst, ncols, nrows, item_ct1);
         });
 }
