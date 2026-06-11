@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-LLAMA_KERNELS="dequantize_mul_mat_vec_q4_K_sycl,dequantize_mul_mat_vec_q6_K_sycl,launch_kernel,rms_norm_mul_f32_sycl,gemm_kernel"
+LLAMA_KERNELS="dequantize_mul_mat_vec_q4_K_sycl,dequantize_mul_mat_vec_q6_K_sycl,ggml_sycl_fused_q4k_swiglu_esimd,launch_kernel,rms_norm_mul_f32_sycl,gemm_kernel"
 IPEX_KERNELS="mlp_forward_q4_k_kernel,linear_forward_kernel,ggml_sycl_op_dequantize_mul_mat_vec_q6_k,sdp_fp16_kernel"
 KERNELS="${LLAMA_KERNELS},${IPEX_KERNELS}"
 GROUP="ComputeBasic"
