@@ -10,6 +10,21 @@
     #endif
 #endif
 
+// Optional ESIMD Q4_K dequantize-matvec path. Enable at build time with
+// -DGGML_SYCL_Q4K_DMMV_ESIMD=1. Requires the Intel oneAPI (DPC++) compiler and
+// the ESIMD extension header. Mirrors the structure of the IPEX
+// linear_forward_kernel<float, 2, 4, 16, 12> PoC: each work-group computes two
+// output rows, threads in the group stride over the row's super-blocks, the
+// activation slice is loaded once per super-block and reused across both rows,
+// and the math runs on wide ESIMD registers.
+#if defined(GGML_SYCL_Q4K_DMMV_ESIMD) && GGML_SYCL_Q4K_DMMV_ESIMD
+    #if !defined(__INTEL_LLVM_COMPILER)
+        #error "GGML_SYCL_Q4K_DMMV_ESIMD requires the Intel oneAPI (DPC++) compiler"
+    #endif
+    #include <sycl/ext/intel/esimd.hpp>
+    #define GGML_SYCL_Q4K_DMMV_ESIMD_ENABLED 1
+#endif
+
 static void convert_f16(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
     const sycl::half *x = (const sycl::half *)vx;
 
@@ -789,10 +804,12 @@ static void dequantize_mul_mat_vec_q4_k_reorder(const void *__restrict__ vx,
     const uint16_t kmask2 = 0x0f0f;
     const uint16_t kmask3 = 0xc0c0;
 
-    const int tid =
-        item_ct1.get_local_id(2) / K_QUANTS_PER_ITERATION; // 0...31 or 0...16
-    const int ix =
-        item_ct1.get_local_id(2) % K_QUANTS_PER_ITERATION; // 0 or 0,1
+    // Lanes that share a tid and split the row's blocks between them:
+    // SIMD32 -> 2 lanes/tid (each lane strides by 2 over blocks),
+    // SIMD16 -> 1 lane/tid  (each lane processes every block).
+    constexpr int n_ix = GGML_SYCL_Q4K_DMMV_WARP / 16;
+    const int tid = item_ct1.get_local_id(2) / n_ix; // 0...15
+    const int ix  = item_ct1.get_local_id(2) % n_ix; // 0 (SIMD16) or 0,1 (SIMD32)
 
     const int step = 8/K_QUANTS_PER_ITERATION;           // 8 or 4
 
@@ -820,7 +837,7 @@ static void dequantize_mul_mat_vec_q4_k_reorder(const void *__restrict__ vx,
 
     float tmp = 0; // partial sum for thread in warp
 
-    for (int i = ix; i < num_blocks_per_row; i += K_QUANTS_PER_ITERATION) {
+    for (int i = ix; i < num_blocks_per_row; i += n_ix) {
         const int bi = ib0 + i;
 
         const float   * y1 = yy + i*QK_K + y_offset;
@@ -911,7 +928,7 @@ static void dequantize_mul_mat_vec_q4_k_reorder(const void *__restrict__ vx,
 
     // sum up partial sums and write back result
 #pragma unroll
-    for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    for (int mask = GGML_SYCL_Q4K_DMMV_WARP / 2; mask > 0; mask >>= 1) {
         tmp +=
             dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
     }
@@ -1612,6 +1629,169 @@ static void dequantize_mul_mat_vec_q6_K_sycl(const void *vx, const float *y,
         });
 }
 
+#ifdef GGML_SYCL_Q4K_DMMV_ESIMD_ENABLED
+// ESIMD variant of the Q4_K reorder dequantize-matvec. Operates on the SOA
+// reorder layout produced by reorder_qw_q4_k:
+//   [qs: nb*(QK_K/2)] [scales: nb*K_SCALE_SIZE] [dm: nb*sizeof(half2)]
+// where nb = nrows * num_blocks_per_row. Each work-group owns two consecutive
+// output rows and the WG_SIZE threads stride over that row's super-blocks.
+static void dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(const void *vx, const float *y,
+                                                           float *dst, const int ncols,
+                                                           const int nrows,
+                                                           dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    GGML_ASSERT(nrows % 2 == 0);
+
+    const int num_blocks_per_row = ncols / QK_K;
+    const size_t nb = (size_t)nrows * num_blocks_per_row;
+
+    const uint8_t   * qs_base     = (const uint8_t *)vx;
+    const uint8_t   * scales_base = qs_base + nb * (QK_K / 2);
+    // dm is stored as half2 (dall, dmin); read as raw halves since sycl::vec
+    // element access is not available in ESIMD context.
+    const sycl::half * dm_base    = (const sycl::half *)(scales_base + nb * K_SCALE_SIZE);
+
+    constexpr int WG_SIZE = 4;
+    const int workgroups = nrows / 2;
+
+    stream->submit([&](sycl::handler &h) {
+        // Two partial sums per thread (one per output row of the pair).
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG_SIZE * 2), h);
+
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * WG_SIZE), sycl::range<1>(WG_SIZE)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                using namespace sycl::ext::intel::esimd;
+
+                const int lid  = it.get_local_id(0);
+                const int wg   = it.get_group(0);
+                const int row0 = wg * 2; // two consecutive output rows
+
+                // One 32-wide accumulator per output row. Keeping the footprint
+                // small (2 x simd<float,32>) avoids GRF spilling of the
+                // accumulators across the super-block loop. Reduced to one scalar
+                // per row after the loop.
+                simd<float, 32> acc0 = 0.0f; // row0
+                simd<float, 32> acc1 = 0.0f; // row1
+
+                simd<uint8_t, 8> s_lo = 0;
+                simd<uint8_t, 8> s_hi = 0;
+
+                for (int s = lid; s < num_blocks_per_row; s += WG_SIZE) {
+                    // Activation slice for this super-block, shared by both rows.
+                    const float * rhs_ptr = y + (size_t)s * QK_K;
+                    simd<float, 256> rhs_vec = block_load<float, 256>(rhs_ptr);
+
+                    // ---- Load + unpack BOTH output rows of the pair up front ----
+                    // Both rows' accumulators (acc0, acc1) are then updated in the
+                    // SAME q2 iteration below, giving the compiler two independent
+                    // FMA chains to interleave and hide latency (matches IPEX's
+                    // interleaved r115/r116). Total live accumulators stay at 2, so
+                    // this does not reintroduce the GRF spill seen with 4 banks.
+                    const size_t bi0 = (size_t)(row0 + 0) * num_blocks_per_row + s;
+                    const size_t bi1 = (size_t)(row0 + 1) * num_blocks_per_row + s;
+
+                    simd<uint8_t, 128> qb0 = block_load<uint8_t, 128>(qs_base + bi0 * (QK_K / 2));
+                    simd<uint8_t, 128> qb1 = block_load<uint8_t, 128>(qs_base + bi1 * (QK_K / 2));
+                    simd<uint8_t, 12>  sc0 = block_load<uint8_t, 12>(scales_base + bi0 * K_SCALE_SIZE);
+                    simd<uint8_t, 12>  sc1 = block_load<uint8_t, 12>(scales_base + bi1 * K_SCALE_SIZE);
+
+                    const float dall0 = (float)dm_base[bi0 * 2 + 0];
+                    const float dmin0 = (float)dm_base[bi0 * 2 + 1];
+                    const float dall1 = (float)dm_base[bi1 * 2 + 0];
+                    const float dmin1 = (float)dm_base[bi1 * 2 + 1];
+
+                    // get_scale_min_k4 (llama.cpp Q4_K scale layout), vectorized, per row.
+                    //   sc[0..3] = q[0..3] & 63
+                    //   sc[4..7] = (q[8..11] & 0xF) | ((q[0..3] >> 6) << 4)
+                    //   m [0..3] = q[4..7] & 63
+                    //   m [4..7] = (q[8..11] >> 4) | ((q[4..7] >> 6) << 4)
+                    simd<float, 8> sf_lo0, sf_hi0, sf_lo1, sf_hi1;
+                    {
+                        simd<uint8_t, 4> b0 = sc0.select<4, 1>(0);
+                        simd<uint8_t, 4> b1 = sc0.select<4, 1>(4);
+                        simd<uint8_t, 4> b2 = sc0.select<4, 1>(8);
+                        s_lo.select<4, 1>(0) = b0 & simd<uint8_t, 4>(63);
+                        s_lo.select<4, 1>(4) = (b2 & simd<uint8_t, 4>(0x0F)) |
+                                               ((b0 >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
+                        s_hi.select<4, 1>(0) = b1 & simd<uint8_t, 4>(63);
+                        s_hi.select<4, 1>(4) = (b2 >> simd<uint8_t, 4>(4)) |
+                                               ((b1 >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
+                        sf_lo0 = convert<float>(s_lo) * dall0;
+                        sf_hi0 = convert<float>(s_hi) * (-dmin0);
+                    }
+                    {
+                        simd<uint8_t, 4> b0 = sc1.select<4, 1>(0);
+                        simd<uint8_t, 4> b1 = sc1.select<4, 1>(4);
+                        simd<uint8_t, 4> b2 = sc1.select<4, 1>(8);
+                        s_lo.select<4, 1>(0) = b0 & simd<uint8_t, 4>(63);
+                        s_lo.select<4, 1>(4) = (b2 & simd<uint8_t, 4>(0x0F)) |
+                                               ((b0 >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
+                        s_hi.select<4, 1>(0) = b1 & simd<uint8_t, 4>(63);
+                        s_hi.select<4, 1>(4) = (b2 >> simd<uint8_t, 4>(4)) |
+                                               ((b1 >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
+                        sf_lo1 = convert<float>(s_lo) * dall1;
+                        sf_hi1 = convert<float>(s_hi) * (-dmin1);
+                    }
+
+                    simd<uint8_t, 128> lo0 = qb0 & simd<uint8_t, 128>(0x0f);
+                    simd<uint8_t, 128> hi0 = qb0 >> simd<uint8_t, 128>(4);
+                    simd<uint8_t, 128> lo1 = qb1 & simd<uint8_t, 128>(0x0f);
+                    simd<uint8_t, 128> hi1 = qb1 >> simd<uint8_t, 128>(4);
+
+                    // Single fused dequant+MAC loop updating BOTH rows each iteration.
+                    // The two acc chains are co-scheduled so FMA latency is overlapped.
+                    for (int q2 = 0; q2 < 8; q2 += 2) {
+                        const int byte_off = q2 * 16;
+                        simd<float, 32> rlo = rhs_vec.select<32, 1>(q2 * 32);
+                        simd<float, 32> rhi = rhs_vec.select<32, 1>((q2 + 1) * 32);
+
+                        const float l0a = sf_lo0[q2];
+                        const float l0b = sf_lo0[q2 + 1];
+                        const float h0a = sf_hi0[q2];
+                        const float h0b = sf_hi0[q2 + 1];
+                        const float l1a = sf_lo1[q2];
+                        const float l1b = sf_lo1[q2 + 1];
+                        const float h1a = sf_hi1[q2];
+                        const float h1b = sf_hi1[q2 + 1];
+
+                        simd<uint8_t, 32> lo0_sel = lo0.select<32, 1>(byte_off);
+                        simd<uint8_t, 32> hi0_sel = hi0.select<32, 1>(byte_off);
+                        simd<uint8_t, 32> lo1_sel = lo1.select<32, 1>(byte_off);
+                        simd<uint8_t, 32> hi1_sel = hi1.select<32, 1>(byte_off);
+
+                        simd<float, 32> d0lo = convert<float>(lo0_sel) * l0a + h0a;
+                        simd<float, 32> d0hi = convert<float>(hi0_sel) * l0b + h0b;
+                        simd<float, 32> d1lo = convert<float>(lo1_sel) * l1a + h1a;
+                        simd<float, 32> d1hi = convert<float>(hi1_sel) * l1b + h1b;
+
+                        acc0 += rlo * d0lo;
+                        acc1 += rlo * d1lo;
+                        acc0 += rhi * d0hi;
+                        acc1 += rhi * d1hi;
+                    }
+                }
+
+                // Reduce each row's 32-wide accumulator to one scalar.
+                lmem[lid * 2 + 0] = reduce<float>(acc0, std::plus<>{});
+                lmem[lid * 2 + 1] = reduce<float>(acc1, std::plus<>{});
+                it.barrier(sycl::access::fence_space::local_space);
+
+                if (lid == 0) {
+                    float t0 = 0.0f;
+                    float t1 = 0.0f;
+                    for (int t = 0; t < WG_SIZE; ++t) {
+                        t0 += lmem[t * 2 + 0];
+                        t1 += lmem[t * 2 + 1];
+                    }
+                    dst[row0 + 0] = t0;
+                    dst[row0 + 1] = t1;
+                }
+            });
+    });
+}
+#endif // GGML_SYCL_Q4K_DMMV_ESIMD_ENABLED
+
 static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float *y,
                                                      float *dst, const int ncols,
                                                      const int nrows,
@@ -1620,10 +1800,10 @@ static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float
     const int ny = 2 / K_QUANTS_PER_ITERATION;
     const int block_num_y = (nrows + ny - 1) / ny;
     const sycl::range<3> block_nums(1, 1, block_num_y);
-    const sycl::range<3> block_dims(1, ny, QK_WARP_SIZE);
+    const sycl::range<3> block_dims(1, ny, GGML_SYCL_Q4K_DMMV_WARP);
     stream->parallel_for(
         sycl::nd_range<3>(block_nums * block_dims, block_dims),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(QK_WARP_SIZE)]] {
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(GGML_SYCL_Q4K_DMMV_WARP)]] {
             dequantize_mul_mat_vec_q4_k_reorder(vx, y, dst, ncols, nrows, item_ct1);
         });
 }
@@ -1718,7 +1898,11 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
         case GGML_TYPE_Q4_K:
             if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+#ifdef GGML_SYCL_Q4K_DMMV_ESIMD_ENABLED
+                dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+#else
                 dequantize_mul_mat_vec_q4_K_sycl_reorder(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+#endif
             } else {
                 dequantize_mul_mat_vec_q4_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             }
