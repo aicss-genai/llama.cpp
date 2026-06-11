@@ -3569,6 +3569,10 @@ inline bool ggml_sycl_supports_reorder_dmmv(enum ggml_type type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q4_K:
             return true;
+#if defined(GGML_SYCL_Q6K_DMMV_ESIMD) && GGML_SYCL_Q6K_DMMV_ESIMD
+        case GGML_TYPE_Q6_K:
+            return true;
+#endif
         default:
             return false;
     }

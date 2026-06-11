@@ -21,8 +21,21 @@
     #if !defined(__INTEL_LLVM_COMPILER)
         #error "GGML_SYCL_Q4K_DMMV_ESIMD requires the Intel oneAPI (DPC++) compiler"
     #endif
-    #include <sycl/ext/intel/esimd.hpp>
     #define GGML_SYCL_Q4K_DMMV_ESIMD_ENABLED 1
+#endif
+
+// Optional ESIMD Q6_K dequantize-matvec path. Enable with
+// -DGGML_SYCL_Q6K_DMMV_ESIMD=1. Same idea as the Q4_K path but operates on the
+// AOS block_q6_K layout (Q6_K does not use the SOA reorder path).
+#if defined(GGML_SYCL_Q6K_DMMV_ESIMD) && GGML_SYCL_Q6K_DMMV_ESIMD
+    #if !defined(__INTEL_LLVM_COMPILER)
+        #error "GGML_SYCL_Q6K_DMMV_ESIMD requires the Intel oneAPI (DPC++) compiler"
+    #endif
+    #define GGML_SYCL_Q6K_DMMV_ESIMD_ENABLED 1
+#endif
+
+#if defined(GGML_SYCL_Q4K_DMMV_ESIMD_ENABLED) || defined(GGML_SYCL_Q6K_DMMV_ESIMD_ENABLED)
+    #include <sycl/ext/intel/esimd.hpp>
 #endif
 
 static void convert_f16(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
@@ -1792,6 +1805,153 @@ static void dequantize_mul_mat_vec_q4_K_sycl_reorder_esimd(const void *vx, const
 }
 #endif // GGML_SYCL_Q4K_DMMV_ESIMD_ENABLED
 
+#ifdef GGML_SYCL_Q6K_DMMV_ESIMD_ENABLED
+// ESIMD variant of the Q6_K dequantize-matvec on the SOA reorder layout produced
+// by reorder_qw_q6_k:
+//   [ql: nb*(QK_K/2)] [qh: nb*(QK_K/4)] [scales: nb*(QK_K/16)] [d: nb*sizeof(half)]
+// where nb = nrows * num_blocks_per_row. The contiguous, naturally sized per-row
+// arrays let each weight stream be read with a single wide block_load instead of
+// the byte scatter-gathers the AOS block_q6_K layout (210-byte stride) forces.
+// Mirrors the Q4_K ESIMD kernel: each work-group computes two consecutive output
+// rows, the WG_SIZE threads stride over the row's super-blocks, the activation
+// slice is loaded once per super-block and reused across both rows, and both
+// rows' accumulators are updated in the same iteration so the compiler
+// interleaves the two FMA chains (hides FMA latency).
+static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(const void *vx, const float *y,
+                                                           float *dst, const int ncols,
+                                                           const int nrows,
+                                                           dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    GGML_ASSERT(nrows % 2 == 0);
+
+    const int    num_blocks_per_row = ncols / QK_K;
+    const size_t nb = (size_t)nrows * num_blocks_per_row;
+
+    const uint8_t    * ql_base     = (const uint8_t *)vx;
+    const uint8_t    * qh_base     = ql_base + nb * (QK_K / 2);
+    const int8_t     * scales_base = (const int8_t *)(qh_base + nb * (QK_K / 4));
+    const sycl::half * d_base      = (const sycl::half *)(scales_base + nb * (QK_K / 16));
+
+    constexpr int WG_SIZE = 4;
+    const int     workgroups = nrows / 2;
+
+    stream->submit([&](sycl::handler &h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG_SIZE * 2), h);
+
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t)workgroups * WG_SIZE), sycl::range<1>(WG_SIZE)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                using namespace sycl::ext::intel::esimd;
+
+                const int lid  = it.get_local_id(0);
+                const int wg   = it.get_group(0);
+                const int row0 = wg * 2; // two consecutive output rows
+
+                // One 32-wide accumulator per output row (small footprint, no spill).
+                simd<float, 32> acc0 = 0.0f;
+                simd<float, 32> acc1 = 0.0f;
+
+                for (int s = lid; s < num_blocks_per_row; s += WG_SIZE) {
+                    // Activation slice for this super-block, shared by both rows.
+                    simd<float, 256> rhs_vec = block_load<float, 256>(y + (size_t)s * QK_K);
+
+                    const size_t bi0 = (size_t)(row0 + 0) * num_blocks_per_row + s;
+                    const size_t bi1 = (size_t)(row0 + 1) * num_blocks_per_row + s;
+
+                    // Contiguous SOA arrays -> one wide block load per stream.
+                    simd<uint8_t, 128> ql0 = block_load<uint8_t, 128>(ql_base + bi0 * (QK_K / 2));
+                    simd<uint8_t, 128> ql1 = block_load<uint8_t, 128>(ql_base + bi1 * (QK_K / 2));
+                    simd<uint8_t, 64>  qh0 = block_load<uint8_t, 64>(qh_base + bi0 * (QK_K / 4));
+                    simd<uint8_t, 64>  qh1 = block_load<uint8_t, 64>(qh_base + bi1 * (QK_K / 4));
+                    simd<int8_t, 16>   sci0 = block_load<int8_t, 16>(scales_base + bi0 * (QK_K / 16));
+                    simd<int8_t, 16>   sci1 = block_load<int8_t, 16>(scales_base + bi1 * (QK_K / 16));
+
+                    simd<float, 16> sc0 = convert<float>(sci0);
+                    simd<float, 16> sc1 = convert<float>(sci1);
+                    const float d0 = (float)d_base[bi0];
+                    const float d1 = (float)d_base[bi1];
+
+                    // Two halves of 128 weights each.
+                    for (int n = 0; n < 2; ++n) {
+                        simd<uint8_t, 32> ql0a = ql0.select<32, 1>(64 * n);
+                        simd<uint8_t, 32> ql0b = ql0.select<32, 1>(64 * n + 32);
+                        simd<uint8_t, 32> qh0v = qh0.select<32, 1>(32 * n);
+                        simd<uint8_t, 32> ql1a = ql1.select<32, 1>(64 * n);
+                        simd<uint8_t, 32> ql1b = ql1.select<32, 1>(64 * n + 32);
+                        simd<uint8_t, 32> qh1v = qh1.select<32, 1>(32 * n);
+
+                        // Four quant groups, both rows interleaved per group.
+                        // Reconstruct each 32-wide 6-bit group (matches
+                        // dequantize_row_q6_K), q in 0..63:
+                        //   g=0: ql_a low nibble  | (qh bits 0-1) << 4
+                        //   g=1: ql_b low nibble  | (qh bits 2-3) << 2
+                        //   g=2: ql_a high nibble | (qh bits 4-5)
+                        //   g=3: ql_b high nibble | (qh bits 6-7) >> 2
+                        for (int g = 0; g < 4; ++g) {
+                            simd<float, 32> rhs_g = rhs_vec.select<32, 1>(32 * (4 * n + g));
+
+                            // Scale: lanes 0..15 use scales[8n+2g], lanes 16..31 use +1.
+                            const float a0 = sc0[8 * n + 2 * g + 0] * d0;
+                            const float b0 = sc0[8 * n + 2 * g + 1] * d0;
+                            const float a1 = sc1[8 * n + 2 * g + 0] * d1;
+                            const float b1 = sc1[8 * n + 2 * g + 1] * d1;
+
+                            simd<float, 32> sv0;
+                            sv0.select<16, 1>(0)  = a0;
+                            sv0.select<16, 1>(16) = b0;
+                            simd<float, 32> sv1;
+                            sv1.select<16, 1>(0)  = a1;
+                            sv1.select<16, 1>(16) = b1;
+
+                            simd<uint8_t, 32> q0;
+                            simd<uint8_t, 32> q1;
+                            switch (g) {
+                                case 0:
+                                    q0 = (ql0a & simd<uint8_t, 32>(0x0F)) | ((qh0v & simd<uint8_t, 32>(0x03)) << simd<uint8_t, 32>(4));
+                                    q1 = (ql1a & simd<uint8_t, 32>(0x0F)) | ((qh1v & simd<uint8_t, 32>(0x03)) << simd<uint8_t, 32>(4));
+                                    break;
+                                case 1:
+                                    q0 = (ql0b & simd<uint8_t, 32>(0x0F)) | ((qh0v & simd<uint8_t, 32>(0x0C)) << simd<uint8_t, 32>(2));
+                                    q1 = (ql1b & simd<uint8_t, 32>(0x0F)) | ((qh1v & simd<uint8_t, 32>(0x0C)) << simd<uint8_t, 32>(2));
+                                    break;
+                                case 2:
+                                    q0 = (ql0a >> simd<uint8_t, 32>(4)) | (qh0v & simd<uint8_t, 32>(0x30));
+                                    q1 = (ql1a >> simd<uint8_t, 32>(4)) | (qh1v & simd<uint8_t, 32>(0x30));
+                                    break;
+                                default:
+                                    q0 = (ql0b >> simd<uint8_t, 32>(4)) | ((qh0v & simd<uint8_t, 32>(0xC0)) >> simd<uint8_t, 32>(2));
+                                    q1 = (ql1b >> simd<uint8_t, 32>(4)) | ((qh1v & simd<uint8_t, 32>(0xC0)) >> simd<uint8_t, 32>(2));
+                                    break;
+                            }
+
+                            simd<float, 32> deq0 = (convert<float>(q0) - 32.0f) * sv0;
+                            simd<float, 32> deq1 = (convert<float>(q1) - 32.0f) * sv1;
+
+                            acc0 += rhs_g * deq0;
+                            acc1 += rhs_g * deq1;
+                        }
+                    }
+                }
+
+                lmem[lid * 2 + 0] = reduce<float>(acc0, std::plus<>{});
+                lmem[lid * 2 + 1] = reduce<float>(acc1, std::plus<>{});
+                it.barrier(sycl::access::fence_space::local_space);
+
+                if (lid == 0) {
+                    float t0 = 0.0f;
+                    float t1 = 0.0f;
+                    for (int t = 0; t < WG_SIZE; ++t) {
+                        t0 += lmem[t * 2 + 0];
+                        t1 += lmem[t * 2 + 1];
+                    }
+                    dst[row0 + 0] = t0;
+                    dst[row0 + 1] = t1;
+                }
+            });
+    });
+}
+#endif // GGML_SYCL_Q6K_DMMV_ESIMD_ENABLED
+
 static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float *y,
                                                      float *dst, const int ncols,
                                                      const int nrows,
@@ -1913,7 +2073,11 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
         case GGML_TYPE_Q6_K:
             if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+#ifdef GGML_SYCL_Q6K_DMMV_ESIMD_ENABLED
+                dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+#else
                 dequantize_mul_mat_vec_q6_K_sycl_reorder(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+#endif
             } else {
                 dequantize_mul_mat_vec_q6_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             }
