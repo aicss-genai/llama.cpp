@@ -1,10 +1,20 @@
 # SYCL GPU Kernel Optimization Workflow
 
 A reusable, evidence-driven workflow for finding and removing bottlenecks in
-llama.cpp SYCL kernels on Intel GPUs (PVC / Data Center GPU Max). It is both a
-**summary of how the Q4_K dequantize-matvec (DMMV) ESIMD kernel was optimized
-from 62,695 ns to 30,640 ns** (matching the IPEX-LLM reference) and a **guide
-for future kernel work**.
+llama.cpp SYCL kernels on Intel GPUs (PVC / Data Center GPU Max). It distills two
+completed optimizations and is also a guide for future kernel work:
+
+- **Q4_K dequantize-matvec (DMMV) ESIMD: 62,695 ns -> 30,640 ns**, matching the
+  IPEX-LLM reference. This kernel was **latency-bound** (a serial FMA chain); the
+  fix was in the instruction schedule.
+- **Q6_K dequantize-matvec ESIMD: 280,100 ns -> 107,178 ns** (per-launch),
+  *beating* the IPEX-LLM reference (121,841 ns) by ~12%. This kernel was
+  **message/coalescing-bound** (per-lane byte scatter-gathers); the fix was in
+  the data layout.
+
+The two cases deliberately have **different bottleneck classes** - that contrast
+is the point of this guide: the same loop tells you which lever to pull only
+after you classify it from the metrics.
 
 Helper scripts live in [scripts/sycl-kernel-opt/](../../scripts/sycl-kernel-opt).
 
@@ -91,14 +101,26 @@ handles both.
 
 - **High STALL, ACT moderate, SEND not dominant** -> *latency-bound on
   compute dependencies.* This was Q4_K (STALL 33%). The fix is in the
-  instruction schedule (see technique 4), not in memory.
-- **High STALL + high SEND + high bytes** -> *memory-bound.* Improve data
-  layout, coalescing, or caching. (We tested this hypothesis on Q4_K and
-  **disproved** it -- see "fused-meta" failure below.)
+  instruction schedule (see technique 5), not in memory.
+- **High SEND for the SAME bytesRead as a faster reference** -> *message /
+  coalescing-bound.* This was Q6_K: identical 73 MB read, but **3x the SEND
+  count** of IPEX (13.3M vs 4.4M). The data is right, but it is being fetched in
+  far too many narrow messages. Fix the layout so loads coalesce into wide block
+  loads (technique 2 + technique 4). Note the trap below.
+- **High STALL + high SEND + high bytes** -> *bandwidth-bound.* Improve data
+  layout, coalescing, or caching. (We tested this on Q4_K and **disproved** it --
+  see the "fused-meta" failure below; bytes were already minimal.)
 - **Low ACT + low STALL + low OCC** -> *not enough parallelism.* Increase
   work-items / rows-per-group or reduce per-thread footprint.
 - **OCC capped well below 100%** -> per-thread register or SLM pressure; check
   for spill (technique 3).
+
+> **Trap: STALL% is not the score, and a higher-STALL kernel can be faster.**
+> The Q6_K reference (IPEX) ran at **46% STALL vs our 31%** and was still ~2.3x
+> *faster*. Chasing "reduce stall / make the cores busier" would have been
+> exactly wrong: it was message-bound, and the reference simply finished its
+> (stallier) work in 1/3 the messages. **Always classify from the combination
+> and optimize `GpuTime`, never a single proxy metric.**
 
 ### 2. Mirror a known-good reference kernel's *structure* (very high impact)
 
@@ -112,6 +134,18 @@ us most of the way (to ~40 us) before any disassembly.
 Reference its *shape*, not its incidentals. We deliberately did **not** copy
 IPEX's scale bit-packing -- measurement showed our `get_scale_min_k4` unpack
 does fewer shifts (11 vs 19) and was never the bottleneck.
+
+**Mirror the data *layout*, not just the work split.** This was the decisive
+move for Q6_K. The stock kernel read the on-disk **AOS** `block_q6_K` (a 210-byte
+struct: `ql[128] qh[64] scales[16] d`), which is unaligned and interleaves the
+operands -- so every `copy_from()` became a per-lane byte scatter-gather. The
+faster path reads a **SOA reorder layout** (all `ql` for the row contiguous, then
+all `qh`, then `scales`, then `d`), so each operand is one aligned, wide
+`block_load`. llama.cpp already has the reorder machinery (`reorder_qw_*` +
+`ggml_sycl_supports_reorder_dmmv`); enabling it for the type and reading the SOA
+bases is usually cheaper than inventing a new layout. **Caveat:** turning on
+reorder changes the on-device weight layout, so gate it behind your build flag
+and verify numerical correctness (not just metrics) afterwards.
 
 ### 3. Register spill analysis via GenX disassembly (high impact when OCC is low)
 
@@ -132,7 +166,43 @@ footprint small** -- we collapsed to 2 banks (one per output row). Rule of
 thumb: large `simd<>` temporaries that are live across the inner loop are the
 usual spill culprits.
 
-### 4. GenX accumulator-chain analysis (the decisive technique here)
+### 4. GenX LSC message-type analysis (decisive when message/coalescing-bound)
+
+When the profiler says **high SEND for the same bytesRead as a faster
+reference**, the GenX disassembly tells you *why* in one look: count the LSC
+load/store message descriptors and split them into **wide block loads** vs
+**per-lane scatter-gathers**.
+
+```sh
+scripts/sycl-kernel-opt/disasm_genx.sh /tmp/our.spv /tmp/igc_ours 12.60.7
+# the script now prints an "LSC message types" breakdown; or compare two kernels:
+scripts/sycl-kernel-opt/compare_genx_asm.sh /tmp/igc_ours/*.asm /tmp/igc_ipex/*.asm
+```
+
+How to read the descriptors (Xe LSC):
+
+| Descriptor | Meaning | Verdict |
+|---|---|---|
+| `load.ugm.d32x64t.a64` | wide **transposed block** load (the `xNN` count and `t` flag) | good - one message, many contiguous elements |
+| `load.ugm.d8u32.a64 (32\|M0)` | per-lane **byte scatter-gather**, 32 narrow loads | bad - inflates SEND, the message-bound smell |
+
+What we found on Q6_K (AOS ESIMD variant, `numGRF=128`, no spill): **14**
+`d8u32.a64` byte scatter-gathers *per inner iteration* (the `ql`/`qh`/`scales`
+`copy_from`s on the unaligned 210-byte block) against only 4 wide activation
+loads. That is the entire SEND gap.
+
+**The fix** (technique 2, layout mirroring): switch to the contiguous, aligned
+SOA reorder layout. The 14 byte gathers collapsed into 3 wide `block_load`s
+(`block_load<uint8_t,128>` ql + `<uint8_t,64>` qh + `<int8_t,16>` scales). Result:
+SEND **13.27M -> 2.58M** (now *below* IPEX's 4.38M), bytesRead 73 -> 65 MB (wide
+loads waste fewer cache lines), time **280,100 -> 107,178 ns**, beating the
+reference. ACT 32% -> 70%, OCC 61% -> 80%.
+
+Rule: `copy_from()` / gathers on an **unaligned or AOS** buffer lower to
+scatter-gathers; a **contiguous aligned SOA** buffer lowers to block loads. The
+source looks identical; only the GenX (and SEND%) reveals the difference.
+
+### 5. GenX accumulator-chain analysis (decisive when latency-bound)
 
 When the kernel is **latency-bound (high STALL) but not spilling and not
 memory-bound**, the cause is almost always the **dependency chain on the
@@ -177,7 +247,7 @@ banks, so it does not reintroduce spill.
 Result: 40,700 -> 30,640 ns (-25%), STALL 33.5% -> 22.4% (exactly the targeted
 metric), ACT 54.5% -> 61.7%. We now match the reference and exceed its activity.
 
-### 5. SPIR-V disassembly (lower impact -- use to confirm, not to drive)
+### 6. SPIR-V disassembly (lower impact -- use to confirm, not to drive)
 
 SPIR-V text is useful to confirm that a *source* change actually changed the
 program, or to compare op mix against a reference SPIR-V dump. But it is far
@@ -206,14 +276,31 @@ SPIR-V diffing to *prove* a change is real before you bother profiling it.
 | ESIMD v1 (256-wide deq buffer) | 42,109 ns | 1.49x | 35.0% | -- | 76.3% | mirror reference structure (tech 2) |
 | ESIMD 4-bank ILP | 41,727 ns | 1.50x | 32.7% | -- | -- | **spilled** -> reverted (tech 3) |
 | ESIMD 2-bank | 40,700 ns | 1.54x | 33.5% | 54.5% | 76.1% | small footprint, no spill |
-| ESIMD narrow-window | 42,861 ns | -- | -- | -- | -- | identical SPIR-V, RA noise -> reverted (tech 5) |
+| ESIMD narrow-window | 42,861 ns | -- | -- | -- | -- | identical SPIR-V, RA noise -> reverted (tech 6) |
 | ESIMD fused-meta layout | 41,366 ns | -- | 39.0% | -- | -- | SEND -45% but +1.6% time -> **not memory-bound** -> reverted |
-| **ESIMD interleaved rows** | **30,640 ns** | **2.05x** | **22.4%** | **61.7%** | **74.9%** | **GenX acc-chain fix (tech 4)** |
+| **ESIMD interleaved rows** | **30,640 ns** | **2.05x** | **22.4%** | **61.7%** | **74.9%** | **GenX acc-chain fix (tech 5)** |
 | IPEX reference | ~30,000 ns | -- | -- | 57.5% | 72.1% | target reached |
 
 The two reverts in the middle are as important as the wins: they are the
 evidence that ruled out spill-driven ILP and memory layout, leaving the
 accumulator dependency chain as the real cause.
+
+## Worked timeline (Q6_K matvec, hot shape, 181 launches, per-launch GpuTime)
+
+A contrasting case: this kernel was **message-bound, not latency-bound**, so the
+winning lever was data *layout*, not the instruction schedule.
+
+| Variant | Time | x base | STALL | ACT | OCC | SEND | Verdict |
+|---|--:|--:|--:|--:|--:|--:|---|
+| stock scalar (AOS) | 280,100 ns | 1.00x | 31.1% | 32.4% | 60.8% | 13.27M | baseline |
+| ESIMD on AOS block | 168,844 ns | 1.66x | 19.0% | 69.2% | 80.4% | 10.57M | wide activation load + 2 interleaved accs; SEND still high |
+| **ESIMD on SOA reorder** | **107,178 ns** | **2.61x** | **17.8%** | **70.5%** | **79.7%** | **2.58M** | **layout fix: byte gathers -> block loads (tech 2+4)** |
+| IPEX reference | 121,841 ns | 2.30x | 46.2% | 42.5% | 63.9% | 4.38M | target -- *beaten* by 12% |
+
+The story is entirely in the SEND column: the AOS->SOA layout change cut messages
+5.15x (13.27M -> 2.58M, below the reference) for identical math. It also shows the
+STALL trap from technique 1 -- the reference carried *more* stall (46%) yet was
+slower, because message count, not stall, was the constraint.
 
 ---
 
@@ -222,24 +309,34 @@ accumulator dependency chain as the real cause.
 1. **Profile and aggregate per kernel** (`analyze_unitrace_metrics.py`). Get
    `GpuTime`, `STALL`, `ACT`, `OCC`, `SEND`, `bytes`.
 2. **Classify the bottleneck from the metric combination** (table in tech 1):
-   latency-bound, memory-bound, or occupancy-bound.
-3. If a faster reference exists, **match its work decomposition first** (tech 2).
+   latency-bound, message-bound, bandwidth-bound, or occupancy-bound. Compare
+   SEND and bytesRead against a faster reference if one exists -- same bytes +
+   more SEND means message-bound, not bandwidth-bound.
+3. If a faster reference exists, **match its work decomposition and its data
+   layout first** (tech 2). AOS/unaligned -> SOA/aligned is often the single
+   biggest lever for matvec/dequant kernels.
 4. **Disassemble to GenX** and check, in order: spill (`numGRF`, fills/stores),
-   `send` count, `dpas` usage, then the **accumulator/dependency chain**
-   (`compare_genx_asm.sh`).
+   the **LSC message types** (block loads vs `dNNuNN` scatter-gathers,
+   `compare_genx_asm.sh`), `dpas` usage, then the **accumulator/dependency
+   chain**.
 5. **Map metric to machine-code cause:**
    - high STALL + serial mad chain -> interleave independent accumulators.
+   - high SEND + byte scatter-gathers -> move to a contiguous aligned SOA layout
+     so loads coalesce into wide block loads (verify it is the bottleneck:
+     removing already-hidden messages does nothing for wall-clock).
    - low OCC + spill -> shrink live `simd<>` footprint.
-   - high SEND + high bytes -> fix layout/coalescing (verify it is actually the
-     bottleneck before investing -- removing already-hidden messages does
-     nothing for wall-clock).
 6. **Change one thing behind a build flag, re-measure, keep or revert.** Record
-   every result, especially failures.
+   every result, especially failures. **Verify numerical correctness** (not just
+   metrics) whenever you change a data layout or the math.
 
 ## Environment reference
 
 - Build: `docker build -t llama-cpp-sycl --target full -f .devops/intel.Dockerfile .`
 - ESIMD Q4_K path is gated by `-DGGML_SYCL_Q4K_DMMV_ESIMD=1` (default OFF).
+- ESIMD Q6_K path is gated by `-DGGML_SYCL_Q6K_DMMV_ESIMD=1` (default OFF). This
+  flag *also* enables the SOA reorder layout for Q6_K DMMV (it adds
+  `GGML_TYPE_Q6_K` to `ggml_sycl_supports_reorder_dmmv`), so the kernel can do
+  wide block loads. Both flags live in the Dockerfile's `CMAKE_CXX_FLAGS`.
 - PVC device id for `ocloc`: `12.60.7`.
 - `out/` may be root-owned (created by the container); do disassembly work in
   `/tmp`.
@@ -252,5 +349,5 @@ accumulator dependency chain as the real cause.
 |---|---|
 | [analyze_unitrace_metrics.py](../../scripts/sycl-kernel-opt/analyze_unitrace_metrics.py) | Aggregate unitrace metric CSVs per kernel (per-launch averages + total GpuTime). |
 | [extract_kernel_spirv.sh](../../scripts/sycl-kernel-opt/extract_kernel_spirv.sh) | Pull one kernel's SPIR-V module out of `libggml-sycl.so` and disassemble it (VectorComputeINTEL-aware). |
-| [disasm_genx.sh](../../scripts/sycl-kernel-opt/disasm_genx.sh) | Compile a `.spv` to GenX `.asm` + vISA via `ocloc -vc-codegen`, with spill/`numGRF` summary. |
-| [compare_genx_asm.sh](../../scripts/sycl-kernel-opt/compare_genx_asm.sh) | Diff two GenX `.asm` files: spill, send, dpas, opcode histogram, and accumulator-chain structure. |
+| [disasm_genx.sh](../../scripts/sycl-kernel-opt/disasm_genx.sh) | Compile a `.spv` to GenX `.asm` + vISA via `ocloc -vc-codegen`, with spill/`numGRF` and LSC message-type (block load vs scatter-gather) summaries. |
+| [compare_genx_asm.sh](../../scripts/sycl-kernel-opt/compare_genx_asm.sh) | Diff two GenX `.asm` files: spill, send, dpas, opcode histogram, LSC message types (coalescing), and accumulator-chain structure. |

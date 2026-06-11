@@ -60,3 +60,14 @@ for f in "$OUTDIR"/*.asm; do
     grep -hoiE "numGRF=[0-9]+|spill.*size.*[0-9]+|spilled" "$f" | tr '\n' ' '
     echo
 done
+
+echo
+echo "=== LSC message types (wide block loads vs per-lane scatter-gathers) ==="
+echo "    dNNxNNt = wide block/transposed load (good); plain dNNuNN at (32|M0) ="
+echo "    per-lane scatter-gather (the usual cause of high SEND% / message-bound)."
+for f in "$OUTDIR"/*.asm; do
+    [[ -e "$f" ]] || continue
+    echo "--- $(basename "$f") ---"
+    grep -hoE '\b(load|store)\.[a-z0-9.]*d[0-9]+(x[0-9]+)?[a-z]*\.[a-z0-9]+' "$f" \
+        | sort | uniq -c | sort -rn | head -12 || echo "  (no LSC messages found)"
+done

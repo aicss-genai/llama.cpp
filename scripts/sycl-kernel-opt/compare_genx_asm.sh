@@ -15,6 +15,13 @@
 # accumulator stalls on FMA latency; two accumulators updated alternately hide
 # each other's latency. STALL% in the profiler is the corresponding symptom.
 #
+#   6. LSC message-type breakdown -> whether each load is a WIDE block/transposed
+#      load or a per-lane SCATTER-GATHER. This is the one that closed the Q6_K
+#      gap: SEND was 3x the reference because copy_from() on an unaligned AOS
+#      struct lowered to 14 byte scatter-gathers (load.ugm.d8u32.a64) per
+#      iteration; the SOA reorder layout turned them into a few wide block loads
+#      (load.ugm.d32x64t.a64). High SEND% in the profiler is the symptom.
+#
 # Usage:
 #   compare_genx_asm.sh <ours.asm> <reference.asm>
 #
@@ -54,6 +61,27 @@ hist() {
 }
 echo "OURS:"; hist "$OURS"
 echo "REF:";  hist "$REF"
+
+section "LSC MESSAGE TYPES (coalescing)"
+echo "Histogram of LSC load/store descriptors. A descriptor like 'd32x64t' (has"
+echo "an xNN element count and/or a 't' transpose flag) is a WIDE block load -"
+echo "good. A plain 'd8u32'/'d16u32' issued at (32|M0) is a per-lane SCATTER-GATHER"
+echo "- one message moving 32 narrow elements, the usual cause of high SEND%."
+echo
+msg_types() {
+    grep -hoE '\b(load|store)\.[a-z0-9.]*d[0-9]+(x[0-9]+)?[a-z]*\.[a-z0-9]+' "$1" \
+        | sort | uniq -c | sort -rn | head -12
+}
+echo "OURS:"; msg_types "$OURS"
+echo "REF:";  msg_types "$REF"
+echo
+echo "INTERPRETATION:"
+echo "  - Many 'd8u32'/'d16u32' scatter-gathers => uncoalesced narrow loads. Usual"
+echo "    cause: copy_from()/gather on an unaligned or AOS (struct-of-arrays the"
+echo "    WRONG way) layout. Fix: a contiguous, aligned SOA/reorder layout so each"
+echo "    operand becomes one wide block_load (d32xNNt)."
+echo "  - Reference using far fewer, wider messages for the SAME bytesRead is the"
+echo "    tell that you are message/coalescing-bound, not bandwidth-bound."
 
 section "ACCUMULATOR CHAIN STRUCTURE"
 echo "How many times each register is the DESTINATION of a 'mad' (the deeper a"
