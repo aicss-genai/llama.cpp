@@ -139,6 +139,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_gemma3n(params);
         case LLM_ARCH_GEMMA4:
             return new llama_model_gemma4(params);
+        case LLM_ARCH_GEMMA4_ASSISTANT:
+            return new llama_model_gemma4_assistant(params);
         case LLM_ARCH_GEMMA_EMBEDDING:
             return new llama_model_gemma_embedding(params);
         case LLM_ARCH_STARCODER2:
@@ -1205,7 +1207,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
 
-    const int n_layer = hparams.n_layer_all;
+    const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
@@ -1262,10 +1264,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
-    const int i_gpu_start = std::max(n_layer + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer + 1);
+    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
-        const bool is_swa = il < n_layer && hparams.is_swa(il);
+        const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -1281,13 +1283,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
     // assign the repeating layers to the devices according to the splits
-    pimpl->dev_layer.resize(n_layer);
-    for (int il = 0; il < n_layer; ++il) {
+    pimpl->dev_layer.resize(n_layer_all);
+    for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
 
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer);
+    pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -1303,14 +1305,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             throw std::runtime_error("model has expert layers but no expert layers are used");
         }
 
-        layers.resize(n_layer);
+        layers.resize(n_layer_all);
 
         // call the per-model loading function
         load_arch_tensors(ml);
 
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
-        for (int i = 0; i < n_layer; ++i) {
+        for (int i = 0; i < n_layer_all; ++i) {
             auto & layer = layers[i];
 
             // attention weight scales (per-tensor, shape {1})
@@ -1568,7 +1570,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, n_layer);
+        const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
         int n_repeating = n_gpu;
         if (n_repeating > 0) {
@@ -1577,8 +1579,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
 
-        const int max_backend_supported_layers = n_layer + 1;
-        const int max_offloadable_layers       = n_layer + 1;
+        const int max_backend_supported_layers = n_layer_all + 1;
+        const int max_offloadable_layers       = n_layer_all + 1;
 
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
@@ -1717,19 +1719,21 @@ void llama_model::print_info() const {
 
     if (!hparams.vocab_only) {
         LLAMA_LOG_INFO("%s: n_ctx_train           = %u\n",     __func__, hparams.n_ctx_train);
-        LLAMA_LOG_INFO("%s: n_embd                = %u\n",     __func__, hparams.n_embd);
         LLAMA_LOG_INFO("%s: n_embd_inp            = %u\n",     __func__, hparams.n_embd_inp());
+        LLAMA_LOG_INFO("%s: n_embd                = %u\n",     __func__, hparams.n_embd);
+        LLAMA_LOG_INFO("%s: n_embd_out            = %u\n",     __func__, hparams.n_embd_out());
         LLAMA_LOG_INFO("%s: n_layer               = %u\n",     __func__, hparams.n_layer());
-        LLAMA_LOG_INFO("%s: n_head                = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_head(il);    }, hparams.n_layer()).c_str());
-        LLAMA_LOG_INFO("%s: n_head_kv             = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_head_kv(il); }, hparams.n_layer()).c_str());
+        LLAMA_LOG_INFO("%s: n_layer_all           = %u\n",     __func__, hparams.n_layer_all);
+        LLAMA_LOG_INFO("%s: n_head                = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_head(il);    }, hparams.n_layer_all).c_str());
+        LLAMA_LOG_INFO("%s: n_head_kv             = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_head_kv(il); }, hparams.n_layer_all).c_str());
         LLAMA_LOG_INFO("%s: n_rot                 = %u\n",     __func__, hparams.n_rot_full);
         LLAMA_LOG_INFO("%s: n_swa                 = %u\n",     __func__, hparams.n_swa);
         LLAMA_LOG_INFO("%s: is_swa_any            = %u\n",     __func__, hparams.is_swa_any());
         LLAMA_LOG_INFO("%s: n_embd_head_k         = %u\n",     __func__, hparams.n_embd_head_k_full);
         LLAMA_LOG_INFO("%s: n_embd_head_v         = %u\n",     __func__, hparams.n_embd_head_v_full);
-        LLAMA_LOG_INFO("%s: n_gqa                 = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_gqa(il);        }, hparams.n_layer()).c_str());
-        LLAMA_LOG_INFO("%s: n_embd_k_gqa          = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_embd_k_gqa(il); }, hparams.n_layer()).c_str());
-        LLAMA_LOG_INFO("%s: n_embd_v_gqa          = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_embd_v_gqa(il); }, hparams.n_layer()).c_str());
+        LLAMA_LOG_INFO("%s: n_gqa                 = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_gqa(il);        }, hparams.n_layer_all).c_str());
+        LLAMA_LOG_INFO("%s: n_embd_k_gqa          = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_embd_k_gqa(il); }, hparams.n_layer_all).c_str());
+        LLAMA_LOG_INFO("%s: n_embd_v_gqa          = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_embd_v_gqa(il); }, hparams.n_layer_all).c_str());
         LLAMA_LOG_INFO("%s: f_norm_eps            = %.1e\n",   __func__, hparams.f_norm_eps);
         LLAMA_LOG_INFO("%s: f_norm_rms_eps        = %.1e\n",   __func__, hparams.f_norm_rms_eps);
         LLAMA_LOG_INFO("%s: f_clamp_kqv           = %.1e\n",   __func__, hparams.f_clamp_kqv);
@@ -1737,7 +1741,7 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: f_logit_scale         = %.1e\n",   __func__, hparams.f_logit_scale);
         LLAMA_LOG_INFO("%s: f_attn_scale          = %.1e\n",   __func__, hparams.f_attention_scale);
         LLAMA_LOG_INFO("%s: f_attn_value_scale    = %.4f\n",   __func__, hparams.f_attn_value_scale);
-        LLAMA_LOG_INFO("%s: n_ff                  = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_ff(il); }, hparams.n_layer()).c_str());
+        LLAMA_LOG_INFO("%s: n_ff                  = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_ff(il); }, hparams.n_layer_all).c_str());
         LLAMA_LOG_INFO("%s: n_expert              = %u\n",     __func__, hparams.n_expert);
         LLAMA_LOG_INFO("%s: n_expert_used         = %u\n",     __func__, hparams.n_expert_used);
         LLAMA_LOG_INFO("%s: n_expert_groups       = %d\n",     __func__, hparams.n_expert_groups);
@@ -1764,7 +1768,7 @@ void llama_model::print_info() const {
                         [](const auto & entry) { return entry >= 0; })) {
             LLAMA_LOG_INFO("%s: deepstack_mapping_arr = %s\n", __func__,
                            print_f([&](uint32_t il) { return hparams.deepstack_mapping_arr[il]; },
-                           hparams.n_layer()).c_str());
+                           hparams.n_layer_all).c_str());
         }
         // MRoPE (Multi-axis Rotary Position Embedding) sections
         if (const auto & s = hparams.rope_sections; s[0] || s[1] || s[2] || s[3]) {
@@ -2113,8 +2117,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr));
                     }
                 } else {
-                    llama_memory_i::layer_reuse_cb reuse = nullptr;
                     llama_kv_cache::layer_filter_cb filter = nullptr;
+                    llama_memory_i::layer_reuse_cb reuse = nullptr;
+                    llama_kv_cache::layer_share_cb share = nullptr;
 
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](uint32_t il) {
@@ -2143,20 +2148,53 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
-                        res = new llama_kv_cache_iswa(
-                                *this,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                params.swa_full,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                cparams.n_ubatch,
-                                1,
-                                filter,
-                                reuse);
+                        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+                            llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
+
+                            share = [&](int32_t il) {
+                                const llama_model * model_other = llama_get_model(cparams.ctx_other);
+
+                                if (hparams.is_swa(il)) {
+                                    return llama_model_n_layer(model_other) - 2;
+                                }
+
+                                return llama_model_n_layer(model_other) - 1;
+                            };
+
+                            res = new llama_kv_cache_iswa(
+                                    *this,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    params.swa_full,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    cparams.n_ubatch,
+                                    1,
+                                    mem_other,
+                                    filter,
+                                    reuse,
+                                    share);
+                        } else {
+                            res = new llama_kv_cache_iswa(
+                                    *this,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    params.swa_full,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    cparams.n_ubatch,
+                                    1,
+                                    nullptr,
+                                    filter,
+                                    reuse,
+                                    share);
+                        }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
@@ -2173,7 +2211,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 1,
                                 hparams.n_swa,
                                 hparams.swa_type,
+                                nullptr,
                                 filter,
+                                nullptr,
                                 nullptr);
                     }
                 }
@@ -2406,6 +2446,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_OPENELM:
