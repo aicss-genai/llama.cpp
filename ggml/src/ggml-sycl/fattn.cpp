@@ -12,12 +12,35 @@
 
 
 #include <sycl/sycl.hpp>
+#include <cstdlib>
 #include "dpct/helper.hpp"
 #include "common.hpp"
 #include "fattn-common.hpp"
 #include "fattn-tile.hpp"
 #include "fattn-vec.hpp"
+#include "fattn-vec-ipex.hpp"
+#include "fattn-vec-esimd.hpp"
 #include "fattn.hpp"
+
+// PROTOTYPE toggle: GGML_SYCL_FATTN_IPEX=1 routes the F16/D128 single-token decode
+// case to the IPEX-style single-pass vec kernel for A/B profiling.
+static bool ggml_sycl_fattn_ipex_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("GGML_SYCL_FATTN_IPEX");
+        return e && e[0] == '1';
+    }();
+    return enabled;
+}
+
+// PROTOTYPE toggle: GGML_SYCL_FATTN_ESIMD=1 routes the same decode case to the ESIMD
+// flash-attention kernel for A/B profiling against the SIMT prototype and IPEX.
+static bool ggml_sycl_fattn_esimd_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("GGML_SYCL_FATTN_ESIMD");
+        return e && e[0] == '1';
+    }();
+    return enabled;
+}
 
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
@@ -40,6 +63,26 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
+
+    // PROTOTYPE: IPEX-style single-pass kernel for the F16/D128 decode shape.
+    if (ggml_sycl_fattn_ipex_enabled() || ggml_sycl_fattn_esimd_enabled()) {
+        const ggml_tensor * sinks = dst->src[4];
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+        const bool kv_f16 = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_F32) &&
+                            (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_F32);
+        if (Q->ne[0] == 128 && Q->ne[1] == 1 && kv_f16 && sinks == nullptr && logit_softcap == 0.0f) {
+            // ESIMD path requires K/V already F16 (no on-the-fly conversion in the prototype).
+            if (ggml_sycl_fattn_esimd_enabled() && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+                ggml_sycl_flash_attn_ext_vec_esimd_case<128, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+                return;
+            }
+            if (ggml_sycl_fattn_ipex_enabled()) {
+                ggml_sycl_flash_attn_ext_vec_ipex_case<128, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+                return;
+            }
+        }
+    }
 
 #ifdef GGML_SYCL_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
@@ -195,9 +238,12 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
+                // Prototype (change #2): route single-token decode to the
+                // register-resident vec kernel even when the GQA optimization
+                // applies. The vec kernel handles GQA internally (gqa_ratio) and
+                // avoids the tile kernel's barrier-heavy SLM staging, which
+                // dominates runtime for this short-batch shape.
+                return BEST_FATTN_KERNEL_VEC;
             }
         } else {
             if (Q->ne[1] <= 2) {
