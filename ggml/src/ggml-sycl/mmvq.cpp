@@ -4,6 +4,7 @@
 #include "common.hpp"
 #include "quants.hpp"
 #include "vecdotq.hpp"
+#include "mmvq_esimd.hpp"
 
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
@@ -2177,8 +2178,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
                     } else {
+#ifdef GGML_SYCL_ESIMD_MMVQ
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_esimd\n");
+                        reorder_mul_mat_vec_q4_k_q8_1_esimd(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+#else
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl\n");
                         reorder_mul_mat_vec_q4_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+#endif
                     }
                 } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                     const int stride_col_y   = src1_padded_col_size / QK8_1;

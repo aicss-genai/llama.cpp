@@ -607,7 +607,18 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
         const int vl = get_int_from_uint8(ql, iqs);
         const int vh = get_int_from_uint8(qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
 
-        const int8_t * scs = scales + scale_offset;
+        // Scales: the reordered scale block base (d_offset.first) is a multiple of
+        // QK_K/16 == 16 bytes, hence 4-byte aligned. scale_offset is not always a
+        // multiple of 4, so byte-indexing scales[scale_offset + {0,4}] makes the
+        // compiler emit 1-byte gather loads (LSC d8u32). Instead, read the two needed
+        // scales (at scale_offset and scale_offset+4) via aligned 32-bit word loads
+        // and extract the byte: both lie in adjacent aligned words within the 16-byte
+        // scale block, so this is in-bounds and alignment-safe.
+        const int * scales32 = reinterpret_cast<const int *>(scales);
+        const int   scs_word  = scale_offset >> 2;        // aligned 32-bit word index
+        const int   scs_shift = (scale_offset & 3) * 8;   // byte position within word
+        const int8_t sc0 = static_cast<int8_t>(scales32[scs_word]     >> scs_shift);
+        const int8_t sc1 = static_cast<int8_t>(scales32[scs_word + 1] >> scs_shift);
 
         const int u0 = get_int_from_int8_aligned(
             q8_1_quant_ptr + bq8_offset * QK8_1, iqs % QI8_1);
@@ -617,7 +628,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
         const float d81 = (*(q8_1_ds + bq8_offset + 2))[0];
 
         return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
-            vl, vh, u0, u1, scs[0], scs[4], *d, d80, d81);
+            vl, vh, u0, u1, sc0, sc1, *d, d80, d81);
     }
 };
 #define VDR_Q4_0_Q8_1_MMVQ 2
