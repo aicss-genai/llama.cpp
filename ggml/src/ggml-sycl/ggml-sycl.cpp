@@ -3793,6 +3793,83 @@ static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
     return true;
 }
 
+#ifdef GGML_SYCL_ESIMD_DPAS
+// Separate reorder layout for the xmx::dpas ESIMD Q4_K MMVQ path. It pre-transposes
+// the weights into the u4 VNNI tiles dpas consumes, so the kernel block_loads ready
+// tiles with no in-kernel transpose. This is a DISTINCT layout from reorder_qw_q4_k
+// (which convert/getrows/dmmv/mmq/scalar-mmvq read); only the dpas kernel reads this.
+//
+// In-place, same 144 B/block as the canonical layout. For a 16-row group rg (rows
+// 16*rg..16*rg+15), super-block sb in [0,bpr), sub-block ss in [0,8), grp=rg*bpr+sb:
+//   weights : data, nblocks*128 B. One 256-B VNNI tile per (grp,ss), tile grp*8+ss.
+//             nibble(k,n) at vidx(k,n) = ((k/8)*16 + n)*8 + (k%8) (verified probe).
+//   scales  : +nblocks*128, nblocks*12 B. SOA-by-byte: scale[grp*192 + j*16 + n].
+//   dm      : +nblocks*12,  nblocks*4 B. 16 dall halves then 16 dmin halves per grp.
+static bool reorder_qw_q4_k_dpas(uint8_t * data_device, const int ncols, const int nrows, size_t size,
+                                 dpct::queue_ptr stream) {
+    GGML_ASSERT(size % sizeof(block_q4_K) == 0);
+    GGML_ASSERT(ncols % QK_K == 0);
+
+    const int    nblocks = size / sizeof(block_q4_K);
+    const int    bpr     = ncols / QK_K;  // super-blocks per row
+
+    sycl_reorder_temp_buffer tmp(stream, size);
+    if (!tmp) {
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
+        return false;
+    }
+    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
+
+    sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
+    if (!g_ggml_sycl_use_async_mem_op) {
+        copy_event.wait();
+    }
+
+    auto *       qs_ptr    = data_device;
+    auto *       scale_ptr = qs_ptr + (size_t) nblocks * (QK_K / 2);
+    sycl::half * dm_ptr    = (sycl::half *) (scale_ptr + (size_t) nblocks * K_SCALE_SIZE);
+
+    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
+        const block_q4_K * x  = (const block_q4_K *) tmp_buf;
+        const int          ib = i;
+
+        const int r   = ib / bpr;          // output row
+        const int sb  = ib % bpr;          // super-block within the row
+        const int n   = r % 16;            // lane within the 16-row group
+        const int grp = (r / 16) * bpr + sb;
+
+        // weights -> 8 VNNI tiles (one per sub-block), this row owns lane n.
+        for (int ss = 0; ss < 8; ++ss) {
+            uint8_t * tile = qs_ptr + ((size_t) (grp * 8 + ss)) * 256;
+            const int  qoff = (ss / 2) * 32;
+            const bool even = (ss % 2) == 0;
+            for (int k = 0; k < 32; k += 2) {
+                const uint8_t s0   = x[ib].qs[qoff + k];
+                const uint8_t s1   = x[ib].qs[qoff + k + 1];
+                const uint8_t nib0 = even ? (s0 & 0x0F) : (s0 >> 4);
+                const uint8_t nib1 = even ? (s1 & 0x0F) : (s1 >> 4);
+                // vidx(k,n) is even and vidx(k+1,n)=vidx(k,n)+1 share one byte;
+                // each byte is owned by exactly this lane n (no cross-item RMW).
+                const int vidx = ((k / 8) * 16 + n) * 8 + (k % 8);
+                tile[vidx / 2] = (uint8_t) ((nib1 << 4) | nib0);
+            }
+        }
+
+        for (int j = 0; j < K_SCALE_SIZE; ++j) {
+            scale_ptr[(size_t) grp * 192 + j * 16 + n] = x[ib].scales[j];
+        }
+
+        dm_ptr[(size_t) grp * 32 + n]      = x[ib].dm[0];  // dall
+        dm_ptr[(size_t) grp * 32 + 16 + n] = x[ib].dm[1];  // dmin
+    });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        reorder_event.wait_and_throw();
+    }
+    return true;
+}
+#endif  // GGML_SYCL_ESIMD_DPAS
+
 static bool reorder_qw_q3_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
     GGML_ASSERT(size % sizeof(block_q3_K) == 0);
     GGML_ASSERT(offset % sizeof(block_q3_K) == 0);
@@ -3956,7 +4033,11 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
         case GGML_TYPE_Q3_K:
             return reorder_qw_q3_k(data_device, size, 0, stream);
         case GGML_TYPE_Q4_K:
+#ifdef GGML_SYCL_ESIMD_DPAS
+            return reorder_qw_q4_k_dpas(data_device, ncols, nrows, size, stream);
+#else
             return reorder_qw_q4_k(data_device, size, 0, stream);
+#endif
         case GGML_TYPE_Q5_K:
             return reorder_qw_q5_k(data_device, size, 0, stream);
         case GGML_TYPE_Q6_K:

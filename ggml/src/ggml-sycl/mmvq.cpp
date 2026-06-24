@@ -2169,6 +2169,10 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q4_K:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    // The dpas path uses a distinct VNNI reorder layout the scalar
+                    // multi-column decoder cannot read, so route every column through
+                    // the per-column dpas kernel below instead of switch_ncols.
+#if !defined(GGML_SYCL_ESIMD_DPAS)
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2177,8 +2181,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                             src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
-                    } else {
-#ifdef GGML_SYCL_ESIMD_MMVQ
+                    } else
+#endif
+                    {
+#if defined(GGML_SYCL_ESIMD_DPAS)
+                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_dpas\n");
+                        reorder_mul_mat_vec_q4_k_q8_1_dpas(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+#elif defined(GGML_SYCL_ESIMD_MMVQ)
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_esimd\n");
                         reorder_mul_mat_vec_q4_k_q8_1_esimd(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
 #else

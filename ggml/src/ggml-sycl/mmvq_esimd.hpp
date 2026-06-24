@@ -16,4 +16,14 @@ void reorder_mul_mat_vec_q4_k_q8_1_esimd(const void * vx, const void * vy, float
 
 #endif  // GGML_SYCL_ESIMD_MMVQ
 
+#ifdef GGML_SYCL_ESIMD_DPAS
+
+// xmx::dpas Q4_K MMVQ path. Reads the dpas VNNI reorder layout written by
+// reorder_qw_q4_k_dpas (16 output rows per dpas instruction). Distinct from the
+// _esimd dp4a path above and selected by a distinct compile flag.
+void reorder_mul_mat_vec_q4_k_q8_1_dpas(const void * vx, const void * vy, float * dst, const int ncols,
+                                        const int nrows, dpct::queue_ptr stream);
+
+#endif  // GGML_SYCL_ESIMD_DPAS
+
 #endif  // GGML_SYCL_MMVQ_ESIMD_HPP
