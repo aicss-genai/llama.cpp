@@ -153,9 +153,6 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
     //const size_t s13 = nb13 / ggml_element_size(src1);
 
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
-
         stream->parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) {

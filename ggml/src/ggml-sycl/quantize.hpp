@@ -124,8 +124,6 @@ void quantize_row_q8_1_sycl(const float * x, void * vy, const int kx, const int 
     auto local_range      = std::size_t(WARP_SIZE);
     auto num_quant_blocks = ky * (kx / QK8_1);
     auto global_range     = num_quant_blocks * local_range;
-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-
     stream->parallel_for(sycl::nd_range<1>({ global_range }, { local_range }),
                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                              quantize_f<QK8_1 / WARP_SIZE>()(x, vy, kx, kx_padded, it);
