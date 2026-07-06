@@ -317,8 +317,8 @@ static __dpct_inline__ void quantize_q8_1_to_shared(const float * __restrict__ x
 #pragma unroll
     for (int mask = QI8_1/2; mask > 0; mask >>= 1) {
         amax = sycl::fmax(
-            amax, dpct::permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), amax, mask));
-        sum += dpct::permute_sub_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), sum, mask);
+            amax, sycl::select_from_group(sycl::ext::oneapi::this_work_item::get_sub_group(), amax, sycl::ext::oneapi::this_work_item::get_sub_group().get_local_linear_id() ^ mask));
+        sum += sycl::select_from_group(sycl::ext::oneapi::this_work_item::get_sub_group(), sum, sycl::ext::oneapi::this_work_item::get_sub_group().get_local_linear_id() ^ mask);
     }
 
     const float d = amax / 127;

@@ -95,7 +95,7 @@ static void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat * 
     const int mask_start = ncols > GGML_SYCL_DMMV_X ? WARP_SIZE >> 1 : WARP_SIZE >> 2;
     for (int mask = mask_start; mask > 0; mask >>= 1) {
         tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
     }
 
     if (tid == 0) {
@@ -201,7 +201,7 @@ static void dequantize_mul_mat_vec_reorder(const void * __restrict__ vx, const d
     const int mask_start = ncols > GGML_SYCL_DMMV_X ? WARP_SIZE >> 1 : WARP_SIZE >> 2;
     for (int mask = mask_start; mask > 0; mask >>= 1) {
         tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
     }
 
     if (tid == 0) {
@@ -363,10 +363,10 @@ static void dequantize_mul_mat_vec_q2_k(const void *__restrict__ vx,
 #endif
 
     // sum up partial sums and write back result
+    const auto sg = item_ct1.get_sub_group();
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+        tmp += sycl::select_from_group(sg, tmp, sg.get_local_linear_id() ^ mask);
     }
 
     if (item_ct1.get_local_id(2) == 0) {
@@ -475,10 +475,10 @@ static void dequantize_mul_mat_vec_q3_k(const void *__restrict__ vx,
 #endif
 
     // sum up partial sums and write back result
+    const auto sg = item_ct1.get_sub_group();
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+        tmp += sycl::select_from_group(sg, tmp, sg.get_local_linear_id() ^ mask);
     }
 
     if (item_ct1.get_local_id(2) == 0) {
@@ -573,10 +573,10 @@ static void dequantize_mul_mat_vec_q3_k_reorder(const void *__restrict__ vx,
 #endif
 
     // sum up partial sums and write back result
+    const auto sg = item_ct1.get_sub_group();
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+        tmp += sycl::select_from_group(sg, tmp, sg.get_local_linear_id() ^ mask);
     }
 
     if (item_ct1.get_local_id(2) == 0) {
@@ -721,10 +721,10 @@ static void dequantize_mul_mat_vec_q4_k(const void *__restrict__ vx,
 #endif
 
     // sum up partial sums and write back result
+    const auto sg = item_ct1.get_sub_group();
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+        tmp += sycl::select_from_group(sg, tmp, sg.get_local_linear_id() ^ mask);
     }
 
     if (tid == 0) {
@@ -879,10 +879,10 @@ static void dequantize_mul_mat_vec_q4_k_reorder(const void *__restrict__ vx,
 #endif
 
     // sum up partial sums and write back result
+    const auto sg = item_ct1.get_sub_group();
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+        tmp += sycl::select_from_group(sg, tmp, sg.get_local_linear_id() ^ mask);
     }
 
     if (tid == 0) {
@@ -1008,10 +1008,10 @@ static void dequantize_mul_mat_vec_q5_k(const void *__restrict__ vx,
 #endif
 
     // sum up partial sums and write back result
+    const auto sg = item_ct1.get_sub_group();
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+        tmp += sycl::select_from_group(sg, tmp, sg.get_local_linear_id() ^ mask);
     }
 
     if (item_ct1.get_local_id(2) == 0) {
@@ -1125,7 +1125,7 @@ static void dequantize_mul_mat_vec_q5_k_reorder(const void *__restrict__ vx,
 #pragma unroll
     for (int mask = QK_WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
     }
 
     if (item_ct1.get_local_id(2) == 0) {
@@ -1242,7 +1242,7 @@ static void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx, const floa
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
     }
 
     if (tid == 0) {
@@ -1367,7 +1367,7 @@ static void dequantize_mul_mat_vec_q6_k_reorder(const void * __restrict__ vx, co
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
         tmp +=
-            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+            sycl::select_from_group(item_ct1.get_sub_group(), tmp, item_ct1.get_sub_group().get_local_linear_id() ^ mask);
     }
 
     if (tid == 0) {
@@ -1593,9 +1593,10 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder(const void *vx, const dfloa
                 }
 
                 // reduce
+                const auto sg = item_ct1.get_sub_group();
                 const int mask_start = ncols > GGML_SYCL_DMMV_X ? WARP_SIZE >> 1 : WARP_SIZE >> 2;
                 for (int mask = mask_start; mask > 0; mask >>= 1) {
-                    tmp += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+                    tmp += sycl::select_from_group(sg, tmp, sg.get_local_linear_id() ^ mask);
                 }
 
                 if (tid == 0) {
