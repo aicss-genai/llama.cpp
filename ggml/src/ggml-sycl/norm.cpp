@@ -211,12 +211,12 @@ static void rms_norm_mul_f32(const float * x, const float * mul, const float * a
         const int64_t stride_sample,
         const int64_t mul_stride_row, const int64_t mul_stride_channel,
         const int64_t mul_stride_sample,
-        const int64_t mul_ncols, const int64_t mul_nrows,
-        const int64_t mul_nchannels, const int64_t mul_nsamples,
+        const sycl::uint3 mul_ncols_packed, const sycl::uint3 mul_nrows_packed,
+        const sycl::uint3 mul_nchannels_packed, const sycl::uint3 mul_nsamples_packed,
         const int64_t add_stride_row, const int64_t add_stride_channel,
         const int64_t add_stride_sample,
-        const int64_t add_ncols, const int64_t add_nrows,
-        const int64_t add_nchannels, const int64_t add_nsamples,
+        const sycl::uint3 add_ncols_packed, const sycl::uint3 add_nrows_packed,
+        const sycl::uint3 add_nchannels_packed, const sycl::uint3 add_nsamples_packed,
         const float eps, const sycl::nd_item<3> & item_ct1, float * s_sum, int block_size) {
 
     const int nrows     = item_ct1.get_group_range(2);
@@ -234,9 +234,9 @@ static void rms_norm_mul_f32(const float * x, const float * mul, const float * a
     x   += strided_offset;
     dst += packed_offset;
 
-    const auto mul_row     = row % mul_nrows;
-    const auto mul_channel = channel % mul_nchannels;
-    const auto mul_sample  = sample % mul_nsamples;
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
     const auto mul_offset  = calculate_offset<3>({mul_stride_sample, mul_stride_channel, mul_stride_row}, {mul_sample, mul_channel, mul_row});
     mul += mul_offset;
 
@@ -267,20 +267,20 @@ static void rms_norm_mul_f32(const float * x, const float * mul, const float * a
     const float scale = sycl::rsqrt(mean + eps);
 
     if (add) {
-        const auto add_row     = row % add_nrows;
-        const auto add_channel = channel % add_nchannels;
-        const auto add_sample  = sample % add_nsamples;
+        const uint32_t add_row     = fastmodulo(row, add_nrows_packed);
+        const uint32_t add_channel = fastmodulo(channel, add_nchannels_packed);
+        const uint32_t add_sample  = fastmodulo(sample, add_nsamples_packed);
         const auto add_offset  = calculate_offset<3>({add_stride_sample, add_stride_channel, add_stride_row}, {add_sample, add_channel, add_row});
         add += add_offset;
 
         for (int col = tid; col < ncols; col += block_size) {
-            const auto mul_col = col % mul_ncols;
-            const auto add_col = col % add_ncols;
+            const uint32_t mul_col = fastmodulo(col, mul_ncols_packed);
+            const uint32_t add_col = fastmodulo(col, add_ncols_packed);
             dst[col] = scale * x[col] * mul[mul_col] + add[add_col];
         }
     } else {
         for (int col = tid; col < ncols; col += block_size) {
-            const auto mul_col = col % mul_ncols;
+            const uint32_t mul_col = fastmodulo(col, mul_ncols_packed);
             dst[col] = scale * x[col] * mul[mul_col];
         }
     }
@@ -460,10 +460,21 @@ static void rms_norm_mul_f32_sycl(const float * x, const float * mul, const floa
         const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
         const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
-        const int64_t mul_ncols, const int64_t mul_nrows, const int64_t mul_nchannels, const int64_t mul_nsamples,
+        const uint32_t mul_ncols, const uint32_t mul_nrows, const uint32_t mul_nchannels, const uint32_t mul_nsamples,
         const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
-        const int64_t add_ncols, const int64_t add_nrows, const int64_t add_nchannels, const int64_t add_nsamples,
+        const uint32_t add_ncols, const uint32_t add_nrows, const uint32_t add_nchannels, const uint32_t add_nsamples,
         const float eps, queue_ptr stream, int device) {
+
+    const sycl::uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+    const sycl::uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+    const sycl::uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+    const sycl::uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+
+    // Only initialize ADD fastdiv when add is not nullptr (3-op fusion)
+    const sycl::uint3 add_ncols_packed     = add ? init_fastdiv_values(add_ncols) : sycl::uint3(0, 0, 0);
+    const sycl::uint3 add_nrows_packed     = add ? init_fastdiv_values(add_nrows) : sycl::uint3(0, 0, 0);
+    const sycl::uint3 add_nchannels_packed = add ? init_fastdiv_values(add_nchannels) : sycl::uint3(0, 0, 0);
+    const sycl::uint3 add_nsamples_packed  = add ? init_fastdiv_values(add_nsamples) : sycl::uint3(0, 0, 0);
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
@@ -474,9 +485,9 @@ static void rms_norm_mul_f32_sycl(const float * x, const float * mul, const floa
                 [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                     rms_norm_mul_f32(x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample,
                                      mul_stride_row, mul_stride_channel, mul_stride_sample,
-                                     mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                                     mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                                      add_stride_row, add_stride_channel, add_stride_sample,
-                                     add_ncols, add_nrows, add_nchannels, add_nsamples,
+                                     add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed,
                                      eps, item_ct1, nullptr, WARP_SIZE);
                 });
         });
@@ -491,9 +502,9 @@ static void rms_norm_mul_f32_sycl(const float * x, const float * mul, const floa
                 [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                     rms_norm_mul_f32(x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample,
                                      mul_stride_row, mul_stride_channel, mul_stride_sample,
-                                     mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                                     mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                                      add_stride_row, add_stride_channel, add_stride_sample,
-                                     add_ncols, add_nrows, add_nchannels, add_nsamples,
+                                     add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed,
                                      eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size);
                 });
         });
@@ -688,16 +699,16 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
     const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
 
-    const int64_t mul_ne00 = mul_src->ne[0];
-    const int64_t mul_ne01 = mul_src->ne[1];
-    const int64_t mul_ne02 = mul_src->ne[2];
-    const int64_t mul_ne03 = mul_src->ne[3];
+    const uint32_t mul_ncols     = mul_src->ne[0];
+    const uint32_t mul_nrows     = mul_src->ne[1];
+    const uint32_t mul_nchannels = mul_src->ne[2];
+    const uint32_t mul_nsamples  = mul_src->ne[3];
 
     rms_norm_mul_f32_sycl(src0_dd, mul_dd, nullptr, dst_dd,
                            ne00, ne01, ne02, ne03,
                            s01, s02, s03,
                            mul_s01, mul_s02, mul_s03,
-                           mul_ne00, mul_ne01, mul_ne02, mul_ne03,
+                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                            0, 0, 0,
                            0, 0, 0, 0,
                            eps, main_stream, ctx.device);
@@ -758,10 +769,10 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx,
     const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
     const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
 
-    const int64_t mul_ne00 = mul_src->ne[0];
-    const int64_t mul_ne01 = mul_src->ne[1];
-    const int64_t mul_ne02 = mul_src->ne[2];
-    const int64_t mul_ne03 = mul_src->ne[3];
+    const uint32_t mul_ncols     = mul_src->ne[0];
+    const uint32_t mul_nrows     = mul_src->ne[1];
+    const uint32_t mul_nchannels = mul_src->ne[2];
+    const uint32_t mul_nsamples  = mul_src->ne[3];
 
     const size_t ts_add = ggml_type_size(add_src->type);
     GGML_ASSERT(add_src->nb[0] == ts_add);
@@ -769,18 +780,18 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx,
     const int64_t add_s02 = add_src->nb[2] / ts_add;
     const int64_t add_s03 = add_src->nb[3] / ts_add;
 
-    const int64_t add_ne00 = add_src->ne[0];
-    const int64_t add_ne01 = add_src->ne[1];
-    const int64_t add_ne02 = add_src->ne[2];
-    const int64_t add_ne03 = add_src->ne[3];
+    const uint32_t add_ncols     = add_src->ne[0];
+    const uint32_t add_nrows     = add_src->ne[1];
+    const uint32_t add_nchannels = add_src->ne[2];
+    const uint32_t add_nsamples  = add_src->ne[3];
 
     rms_norm_mul_f32_sycl(src0_dd, mul_dd, add_dd, dst_dd,
                            ne00, ne01, ne02, ne03,
                            s01, s02, s03,
                            mul_s01, mul_s02, mul_s03,
-                           mul_ne00, mul_ne01, mul_ne02, mul_ne03,
+                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                            add_s01, add_s02, add_s03,
-                           add_ne00, add_ne01, add_ne02, add_ne03,
+                           add_ncols, add_nrows, add_nchannels, add_nsamples,
                            eps, main_stream, ctx.device);
 }
 
