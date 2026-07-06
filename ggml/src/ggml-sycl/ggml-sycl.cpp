@@ -3135,6 +3135,54 @@ static void ggml_sycl_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     ggml_sycl_op_rms_norm(ctx, dst);
 }
 
+static void ggml_sycl_op_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    const ggml_tensor * unary_src = unary_node->src[0];
+    const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+
+    // All preconditions validated by ggml_sycl_can_fuse()
+    GGML_ASSERT(unary_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(unary_src));
+    GGML_ASSERT(ggml_is_contiguous_1(other_src));
+    GGML_ASSERT(ggml_are_same_shape(unary_src, other_src));
+
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    const float * src_d   = static_cast<const float *>(unary_src->data);
+    const float * other_d = static_cast<const float *>(other_src->data);
+    float * dst_d         = static_cast<float *>(mul_node->data);
+    const int64_t k       = ggml_nelements(mul_node);
+    const int64_t nc      = unary_src->ne[0];
+    const int64_t unary_stride = unary_src->nb[1] / sizeof(float);
+    const int64_t other_stride = other_src->nb[1] / sizeof(float);
+
+    const auto op = ggml_get_unary_op(unary_node);
+
+    stream->parallel_for(sycl::range<1>(k), [=](sycl::id<1> idx) {
+        const int64_t i = idx[0];
+        // Handle strided access
+        const int64_t j0 = (i / nc) * unary_stride + (i % nc);
+        const int64_t j1 = (i / nc) * other_stride + (i % nc);
+        const float x = src_d[j0];
+        float activated;
+        switch (op) {
+            case GGML_UNARY_OP_SILU:
+                activated = x / (1.0f + sycl::native::exp(-x));
+                break;
+            case GGML_UNARY_OP_SIGMOID:
+                activated = 1.0f / (1.0f + sycl::native::exp(-x));
+                break;
+            case GGML_UNARY_OP_SOFTPLUS:
+                activated = x > 20.0f ? x : sycl::log1p(sycl::native::exp(x));
+                break;
+            default:
+                activated = x;
+                break;
+        }
+        dst_d[i] = activated * other_d[j1];
+    });
+}
+
 static void ggml_sycl_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     ggml_sycl_op_rms_norm_back(ctx, dst);
@@ -5176,6 +5224,37 @@ static bool ggml_sycl_can_fuse(ggml_cgraph * cgraph, int node_idx, std::initiali
         return true;
     }
 
+    // UNARY+MUL fusion validation (SiLU, sigmoid, softplus gates)
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
+        const ggml_tensor * unary_node = cgraph->nodes[node_idx];
+        const ggml_tensor * mul_node   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * unary_src  = unary_node->src[0];
+        const ggml_tensor * other_src  = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+
+        // Only F32 supported
+        if (unary_src->type != GGML_TYPE_F32 ||
+            other_src->type != GGML_TYPE_F32 ||
+            mul_node->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        // Require same shape (no broadcasting)
+        if (!ggml_are_same_shape(unary_src, other_src)) {
+            return false;
+        }
+
+        // Kernel assumes contiguous tensors
+        if (!ggml_is_contiguous_1(unary_src) || unary_src->nb[0] != ggml_type_size(unary_src->type)) {
+            return false;
+        }
+
+        if (!ggml_is_contiguous_1(other_src) || other_src->nb[0] != ggml_type_size(other_src->type)) {
+            return false;
+        }
+
+        return true;
+    }
+
     return true;
 }
 
@@ -5201,6 +5280,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            i++;
+            continue;
+        }
+
+        if (node->op == GGML_OP_UNARY &&
+            (ggml_get_unary_op(node) == GGML_UNARY_OP_SILU ||
+             ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID ||
+             ggml_get_unary_op(node) == GGML_UNARY_OP_SOFTPLUS) &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
+            ggml_sycl_op_unary_mul(*sycl_ctx, node, cgraph->nodes[i + 1]);
             i++;
             continue;
         }
