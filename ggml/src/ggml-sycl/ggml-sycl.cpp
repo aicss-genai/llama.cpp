@@ -5135,9 +5135,14 @@ static bool ggml_sycl_can_fuse(ggml_cgraph * cgraph, int node_idx, std::initiali
         return false;
     }
 
-    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add      = nullptr;
+
+        if (ops.size() == 3 && ops.begin()[2] == GGML_OP_ADD) {
+            add = cgraph->nodes[node_idx + 2];
+        }
 
         GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
         GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
@@ -5148,6 +5153,12 @@ static bool ggml_sycl_can_fuse(ggml_cgraph * cgraph, int node_idx, std::initiali
             return false;
         }
 
+        if (add && (add->src[0]->type != GGML_TYPE_F32 ||
+            add->src[1]->type != GGML_TYPE_F32 ||
+            add->type != GGML_TYPE_F32)) {
+            return false;
+        }
+
         // If rms_norm is the B operand, this fusion path does not support expansion of the A operand.
         if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
             return false;
@@ -5155,6 +5166,10 @@ static bool ggml_sycl_can_fuse(ggml_cgraph * cgraph, int node_idx, std::initiali
 
         // rms_norm kernel assumes contiguous rows.
         if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+            return false;
+        }
+
+        if (add && (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous_rows(add->src[1]))) {
             return false;
         }
 
@@ -5173,6 +5188,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        if (node->op == GGML_OP_RMS_NORM &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            ggml_sycl_op_rms_norm_fused_add(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            i += 2;
             continue;
         }
 

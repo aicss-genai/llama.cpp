@@ -206,13 +206,17 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     }
 }
 
-static void rms_norm_mul_f32(const float * x, const float * mul, float * dst,
+static void rms_norm_mul_f32(const float * x, const float * mul, const float * add, float * dst,
         const int ncols, const int64_t stride_row, const int64_t stride_channel,
         const int64_t stride_sample,
         const int64_t mul_stride_row, const int64_t mul_stride_channel,
         const int64_t mul_stride_sample,
         const int64_t mul_ncols, const int64_t mul_nrows,
         const int64_t mul_nchannels, const int64_t mul_nsamples,
+        const int64_t add_stride_row, const int64_t add_stride_channel,
+        const int64_t add_stride_sample,
+        const int64_t add_ncols, const int64_t add_nrows,
+        const int64_t add_nchannels, const int64_t add_nsamples,
         const float eps, const sycl::nd_item<3> & item_ct1, float * s_sum, int block_size) {
 
     const int nrows     = item_ct1.get_group_range(2);
@@ -262,9 +266,23 @@ static void rms_norm_mul_f32(const float * x, const float * mul, float * dst,
     const float mean  = tmp / ncols;
     const float scale = sycl::rsqrt(mean + eps);
 
-    for (int col = tid; col < ncols; col += block_size) {
-        const auto mul_col = col % mul_ncols;
-        dst[col] = scale * x[col] * mul[mul_col];
+    if (add) {
+        const auto add_row     = row % add_nrows;
+        const auto add_channel = channel % add_nchannels;
+        const auto add_sample  = sample % add_nsamples;
+        const auto add_offset  = calculate_offset<3>({add_stride_sample, add_stride_channel, add_stride_row}, {add_sample, add_channel, add_row});
+        add += add_offset;
+
+        for (int col = tid; col < ncols; col += block_size) {
+            const auto mul_col = col % mul_ncols;
+            const auto add_col = col % add_ncols;
+            dst[col] = scale * x[col] * mul[mul_col] + add[add_col];
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const auto mul_col = col % mul_ncols;
+            dst[col] = scale * x[col] * mul[mul_col];
+        }
     }
 }
 
@@ -438,11 +456,13 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
     }
 }
 
-static void rms_norm_mul_f32_sycl(const float * x, const float * mul, float * dst,
+static void rms_norm_mul_f32_sycl(const float * x, const float * mul, const float * add, float * dst,
         const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
         const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const int64_t mul_ncols, const int64_t mul_nrows, const int64_t mul_nchannels, const int64_t mul_nsamples,
+        const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
+        const int64_t add_ncols, const int64_t add_nrows, const int64_t add_nchannels, const int64_t add_nsamples,
         const float eps, queue_ptr stream, int device) {
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
@@ -452,9 +472,11 @@ static void rms_norm_mul_f32_sycl(const float * x, const float * mul, float * ds
             cgh.parallel_for(
                 sycl::nd_range<3>(global_dims * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_mul_f32(x, mul, dst, ncols, stride_row, stride_channel, stride_sample,
+                    rms_norm_mul_f32(x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample,
                                      mul_stride_row, mul_stride_channel, mul_stride_sample,
                                      mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                                     add_stride_row, add_stride_channel, add_stride_sample,
+                                     add_ncols, add_nrows, add_nchannels, add_nsamples,
                                      eps, item_ct1, nullptr, WARP_SIZE);
                 });
         });
@@ -467,9 +489,11 @@ static void rms_norm_mul_f32_sycl(const float * x, const float * mul, float * ds
             cgh.parallel_for(
                 sycl::nd_range<3>(global_dims * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_mul_f32(x, mul, dst, ncols, stride_row, stride_channel, stride_sample,
+                    rms_norm_mul_f32(x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample,
                                      mul_stride_row, mul_stride_channel, mul_stride_sample,
                                      mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                                     add_stride_row, add_stride_channel, add_stride_sample,
+                                     add_ncols, add_nrows, add_nchannels, add_nsamples,
                                      eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size);
                 });
         });
@@ -669,11 +693,94 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int64_t mul_ne02 = mul_src->ne[2];
     const int64_t mul_ne03 = mul_src->ne[3];
 
-    rms_norm_mul_f32_sycl(src0_dd, mul_dd, dst_dd,
+    rms_norm_mul_f32_sycl(src0_dd, mul_dd, nullptr, dst_dd,
                            ne00, ne01, ne02, ne03,
                            s01, s02, s03,
                            mul_s01, mul_s02, mul_s03,
                            mul_ne00, mul_ne01, mul_ne02, mul_ne03,
+                           0, 0, 0,
+                           0, 0, 0, 0,
+                           eps, main_stream, ctx.device);
+}
+
+void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx,
+                                      ggml_tensor * dst, ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
+    const ggml_tensor * rms_norm_src = dst->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const float * src0_dd = static_cast<const float *>(rms_norm_src->data);
+    const float * mul_dd  = nullptr;
+    const ggml_tensor * mul_src = nullptr;
+
+    if (mul_tensor->src[0] == dst) {
+        mul_dd  = static_cast<const float *>(mul_tensor->src[1]->data);
+        mul_src = mul_tensor->src[1];
+    } else if (mul_tensor->src[1] == dst) {
+        mul_dd  = static_cast<const float *>(mul_tensor->src[0]->data);
+        mul_src = mul_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    const float * add_dd  = nullptr;
+    const ggml_tensor * add_src = nullptr;
+
+    if (add_tensor->src[0] == mul_tensor) {
+        add_dd  = static_cast<const float *>(add_tensor->src[1]->data);
+        add_src = add_tensor->src[1];
+    } else if (add_tensor->src[1] == mul_tensor) {
+        add_dd  = static_cast<const float *>(add_tensor->src[0]->data);
+        add_src = add_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    float * dst_dd = static_cast<float *>(add_tensor->data);
+
+    dpct::queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    const int64_t ne00 = rms_norm_src->ne[0];
+    const int64_t ne01 = rms_norm_src->ne[1];
+    const int64_t ne02 = rms_norm_src->ne[2];
+    const int64_t ne03 = rms_norm_src->ne[3];
+
+    const size_t ts0 = ggml_type_size(rms_norm_src->type);
+    GGML_ASSERT(rms_norm_src->nb[0] == ts0);
+    const int64_t s01 = rms_norm_src->nb[1] / ts0;
+    const int64_t s02 = rms_norm_src->nb[2] / ts0;
+    const int64_t s03 = rms_norm_src->nb[3] / ts0;
+
+    const size_t ts_mul = ggml_type_size(mul_src->type);
+    GGML_ASSERT(mul_src->nb[0] == ts_mul);
+    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
+    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
+    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
+
+    const int64_t mul_ne00 = mul_src->ne[0];
+    const int64_t mul_ne01 = mul_src->ne[1];
+    const int64_t mul_ne02 = mul_src->ne[2];
+    const int64_t mul_ne03 = mul_src->ne[3];
+
+    const size_t ts_add = ggml_type_size(add_src->type);
+    GGML_ASSERT(add_src->nb[0] == ts_add);
+    const int64_t add_s01 = add_src->nb[1] / ts_add;
+    const int64_t add_s02 = add_src->nb[2] / ts_add;
+    const int64_t add_s03 = add_src->nb[3] / ts_add;
+
+    const int64_t add_ne00 = add_src->ne[0];
+    const int64_t add_ne01 = add_src->ne[1];
+    const int64_t add_ne02 = add_src->ne[2];
+    const int64_t add_ne03 = add_src->ne[3];
+
+    rms_norm_mul_f32_sycl(src0_dd, mul_dd, add_dd, dst_dd,
+                           ne00, ne01, ne02, ne03,
+                           s01, s02, s03,
+                           mul_s01, mul_s02, mul_s03,
+                           mul_ne00, mul_ne01, mul_ne02, mul_ne03,
+                           add_s01, add_s02, add_s03,
+                           add_ne00, add_ne01, add_ne02, add_ne03,
                            eps, main_stream, ctx.device);
 }
 
