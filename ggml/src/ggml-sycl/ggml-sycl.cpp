@@ -64,6 +64,7 @@
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "ggml-sycl/pool.hpp"
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
